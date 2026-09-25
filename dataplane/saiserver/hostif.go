@@ -52,6 +52,7 @@ type hostif struct {
 	saipb.UnimplementedHostifServer
 	mgr              *attrmgr.AttrMgr
 	dataplane        switchDataplaneAPI
+	mu               sync.RWMutex
 	trapIDToHostifID map[uint64]uint64
 	groupIDToQueue   map[uint64]uint32
 	opts             *dplaneopts.Options
@@ -67,6 +68,8 @@ func (hostif *hostif) Reset() {
 		closeFn()
 	}
 	hostif.remoteClosers = nil
+	hostif.mu.Lock()
+	defer hostif.mu.Unlock()
 	hostif.trapIDToHostifID = map[uint64]uint64{}
 	hostif.groupIDToQueue = map[uint64]uint32{}
 	hostif.remoteHostifs = map[uint64]*pktiopb.HostPortControlMessage{}
@@ -260,9 +263,14 @@ var (
 )
 
 const (
-	bgpPort        = 179
-	trapTableID    = "trap-table"
-	wildcardPortID = 0
+	bgpPort          = 179
+	dhcpServerPort   = 67
+	dhcpClientPort   = 68
+	dhcpv6ServerPort = 547
+	dhcpv6ClientPort = 546
+	ipProtoUDP       = 17
+	trapTableID      = "trap-table"
+	wildcardPortID   = 0
 )
 
 func (hostif *hostif) CreateHostifTrap(ctx context.Context, req *saipb.CreateHostifTrapRequest) (*saipb.CreateHostifTrapResponse, error) {
@@ -323,6 +331,34 @@ func (hostif *hostif) CreateHostifTrap(ctx context.Context, req *saipb.CreateHos
 				WithUint16(bgpPort))),
 		)
 		entriesAdded = 2
+	case saipb.HostifTrapType_HOSTIF_TRAP_TYPE_DHCP, saipb.HostifTrapType_HOSTIF_TRAP_TYPE_DHCP_L2:
+		fwdReq.AppendEntry(fwdconfig.EntryDesc(fwdconfig.FlowEntry(
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_PROTO).
+				WithBytes([]byte{ipProtoUDP}, []byte{0xFF}),
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST).
+				WithUint16(dhcpServerPort))),
+		)
+		fwdReq.AppendEntry(fwdconfig.EntryDesc(fwdconfig.FlowEntry(
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_PROTO).
+				WithBytes([]byte{ipProtoUDP}, []byte{0xFF}),
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST).
+				WithUint16(dhcpClientPort))),
+		)
+		entriesAdded = 2
+	case saipb.HostifTrapType_HOSTIF_TRAP_TYPE_DHCPV6, saipb.HostifTrapType_HOSTIF_TRAP_TYPE_DHCPV6_L2:
+		fwdReq.AppendEntry(fwdconfig.EntryDesc(fwdconfig.FlowEntry(
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_PROTO).
+				WithBytes([]byte{ipProtoUDP}, []byte{0xFF}),
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST).
+				WithUint16(dhcpv6ServerPort))),
+		)
+		fwdReq.AppendEntry(fwdconfig.EntryDesc(fwdconfig.FlowEntry(
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_PROTO).
+				WithBytes([]byte{ipProtoUDP}, []byte{0xFF}),
+			fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST).
+				WithUint16(dhcpv6ClientPort))),
+		)
+		entriesAdded = 2
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown trap type: %v", tType)
 	}
@@ -344,7 +380,9 @@ func (hostif *hostif) CreateHostifTrap(ctx context.Context, req *saipb.CreateHos
 
 func (hostif *hostif) CreateHostifTrapGroup(_ context.Context, req *saipb.CreateHostifTrapGroupRequest) (*saipb.CreateHostifTrapGroupResponse, error) {
 	id := hostif.mgr.NextID()
+	hostif.mu.Lock()
 	hostif.groupIDToQueue[id] = req.GetQueue()
+	hostif.mu.Unlock()
 	return &saipb.CreateHostifTrapGroupResponse{Oid: id}, nil
 }
 
@@ -368,7 +406,9 @@ func (hostif *hostif) CreateHostifTableEntry(ctx context.Context, req *saipb.Cre
 
 	switch entryType := req.GetType(); entryType {
 	case saipb.HostifTableEntryType_HOSTIF_TABLE_ENTRY_TYPE_TRAP_ID:
+		hostif.mu.Lock()
 		hostif.trapIDToHostifID[req.GetTrapId()] = req.GetHostIf()
+		hostif.mu.Unlock()
 		tReq := fwdconfig.TableEntryAddRequest(hostif.dataplane.ID(), trapIDToHostifTable).
 			AppendEntry(
 				fwdconfig.EntryDesc(fwdconfig.ExactEntry(
@@ -402,7 +442,9 @@ func (hostif *hostif) CreateHostifTableEntry(ctx context.Context, req *saipb.Cre
 			return nil, err
 		}
 	case saipb.HostifTableEntryType_HOSTIF_TABLE_ENTRY_TYPE_WILDCARD:
+		hostif.mu.Lock()
 		hostif.trapIDToHostifID[req.GetTrapId()] = wildcardPortID
+		hostif.mu.Unlock()
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported entry type: %v", entryType)
 	}

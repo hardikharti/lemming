@@ -131,6 +131,7 @@ type nextHopGroup struct {
 	saipb.UnimplementedNextHopGroupServer
 	mgr       *attrmgr.AttrMgr
 	dataplane switchDataplaneAPI
+	mu        sync.RWMutex
 	groups    map[uint64]map[uint64]*groupMember // groups is map of next hop groups to a map of next hops
 	groupIsV4 map[uint64]bool                    // map from group id to IP protocol version
 }
@@ -215,6 +216,7 @@ func (nhg *nextHopGroup) updateNextHopGroupMember(ctx context.Context, nhgid, mi
 		return status.Errorf(codes.FailedPrecondition, "group %d does not exist", nhgid)
 	}
 	if m != nil {
+		nhg.mu.Lock()
 		if _, ok := nhg.groupIsV4[nhgid]; !ok { // Use the first member added to group to determine if the group is ipv4.
 			nhAttr := &saipb.GetNextHopAttributeResponse{}
 			err := nhg.mgr.PopulateAttributes(&saipb.GetNextHopAttributeRequest{
@@ -222,10 +224,12 @@ func (nhg *nextHopGroup) updateNextHopGroupMember(ctx context.Context, nhgid, mi
 				AttrType: []saipb.NextHopAttr{saipb.NextHopAttr_NEXT_HOP_ATTR_IP},
 			}, nhAttr)
 			if err != nil {
+				nhg.mu.Unlock()
 				return fmt.Errorf("failed to retrieve next hop attr: %v", err)
 			}
 			nhg.groupIsV4[nhgid] = len(nhAttr.GetAttr().GetIp()) == 4
 		}
+		nhg.mu.Unlock()
 		group[mid] = m
 	} else {
 		delete(group, mid)
@@ -248,9 +252,11 @@ func (nhg *nextHopGroup) updateNextHopGroupMember(ctx context.Context, nhgid, mi
 		return fmt.Errorf("failed to retrieve hash id: %v", err)
 	}
 	hashID := swAttr.GetAttr().GetEcmpHashIpv6()
+	nhg.mu.RLock()
 	if nhg.groupIsV4[nhgid] {
 		hashID = swAttr.GetAttr().GetEcmpHashIpv4()
 	}
+	nhg.mu.RUnlock()
 	hashAttr := &saipb.HashAttribute{}
 	err = nhg.mgr.PopulateAllAttributes(fmt.Sprint(hashID), hashAttr)
 	if err != nil {
