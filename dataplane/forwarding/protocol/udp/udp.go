@@ -95,6 +95,22 @@ func (udp *UDP) field(id fwdpacket.FieldID) frame.Field {
 	}
 }
 
+// updateVXLANSourcePort populates the UDP source port with an RFC 7348
+// inner-flow entropy port when encapsulating VXLAN and no source port is set.
+func (udp *UDP) updateVXLANSourcePort() {
+	if udp.desc == nil || len(udp.header) < udpBytes {
+		return
+	}
+	dstPort := uint16(udp.header.Field(dstOffset, portBytes).Value())
+	srcPort := udp.header.Field(srcOffset, portBytes)
+	if dstPort != vxlan.DefaultPort || srcPort.Value() != 0 {
+		return
+	}
+	if entropyPort := vxlan.ComputeEntropySourcePort(udp.desc); entropyPort != 0 {
+		srcPort.SetValue(uint(entropyPort))
+	}
+}
+
 // Field finds bytes within the UDP header.
 func (udp *UDP) Field(id fwdpacket.FieldID) ([]byte, error) {
 	if field := udp.field(id); field != nil {
@@ -106,7 +122,13 @@ func (udp *UDP) Field(id fwdpacket.FieldID) ([]byte, error) {
 // UpdateField sets bytes within the UDP header.
 func (udp *UDP) UpdateField(id fwdpacket.FieldID, op int, arg []byte) (bool, error) {
 	if field := udp.field(id); field != nil && op == fwdpacket.OpSet {
-		return true, field.Set(arg)
+		if err := field.Set(arg); err != nil {
+			return false, err
+		}
+		if !id.IsUDF && id.Num == fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST {
+			udp.updateVXLANSourcePort()
+		}
+		return true, nil
 	}
 	return false, fmt.Errorf("udp: UpdateField failed, unsupported op %v for field %v", op, id)
 }
@@ -137,13 +159,8 @@ func (udp *UDP) Rebuild() error {
 		return nil
 	}
 
-	dstPort := uint16(udp.header.Field(dstOffset, portBytes).Value())
-	srcPort := uint16(udp.header.Field(srcOffset, portBytes).Value())
-	if dstPort == vxlan.DefaultPort && srcPort == 0 {
-		if entropyPort := vxlan.ComputeEntropySourcePort(udp.desc); entropyPort != 0 {
-			udp.header.Field(srcOffset, portBytes).SetValue(uint(entropyPort))
-		}
-	}
+	// Update source port for VXLAN.
+	udp.updateVXLANSourcePort()
 
 	// Update the length and reset the checksum.
 	length := len(udp.Header()) + udp.desc.PayloadLength()
@@ -162,11 +179,11 @@ func (udp *UDP) Rebuild() error {
 	var sum csum16.Sum
 	_, _ = sum.Write(udp.Header())
 	_, _ = sum.Write(udp.desc.Payload())
-	if f, err = udp.desc.Packet.Field(fwdpacket.NewFieldIDFromNum(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_ADDR_SRC, fwdpacket.LastField)); err != nil {
+	if f, err = udp.desc.EnvelopeField(fwdpacket.NewFieldIDFromNum(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_ADDR_SRC, fwdpacket.LastField)); err != nil {
 		return fmt.Errorf("udp: Rebuild failed: %v", err)
 	}
 	_, _ = sum.Write(f)
-	if f, err = udp.desc.Packet.Field(fwdpacket.NewFieldIDFromNum(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_ADDR_DST, fwdpacket.LastField)); err != nil {
+	if f, err = udp.desc.EnvelopeField(fwdpacket.NewFieldIDFromNum(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_ADDR_DST, fwdpacket.LastField)); err != nil {
 		return fmt.Errorf("udp: Rebuild failed: %v", err)
 	}
 	_, _ = sum.Write(f)

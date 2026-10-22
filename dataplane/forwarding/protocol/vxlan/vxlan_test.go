@@ -193,9 +193,9 @@ func TestVXLANEntropyCalculation(t *testing.T) {
 		t.Fatalf("fwdpacket.New failed: %v", err)
 	}
 
-	port1 := ComputeEntropySourcePort(&protocol.Desc{Packet: pkt1.(*protocol.Packet)})
-	port2 := ComputeEntropySourcePort(&protocol.Desc{Packet: pkt2.(*protocol.Packet)})
-	port3 := ComputeEntropySourcePort(&protocol.Desc{Packet: pkt3.(*protocol.Packet)})
+	port1 := ComputeEntropySourcePort(pkt1.(*protocol.Packet).FirstDesc().PayloadDesc())
+	port2 := ComputeEntropySourcePort(pkt2.(*protocol.Packet).FirstDesc().PayloadDesc())
+	port3 := ComputeEntropySourcePort(pkt3.(*protocol.Packet).FirstDesc().PayloadDesc())
 
 	if port1 < EphemeralPortBase {
 		t.Errorf("port1 = %d, want >= %d", port1, EphemeralPortBase)

@@ -123,11 +123,10 @@ func (v *VXLAN) Rebuild() error {
 }
 
 // InnerFlowKey extracts inner header invariant fields (5-tuple and MACs) per RFC 7348.
-// It queries Instance 1 (standard inner frame of a VXLAN-encapsulated packet).
 // Only invariant header fields are included;
 // (such as IP ID or TCP sequence numbers) are excluded to ensure deterministic ECMP flow stability.
 func InnerFlowKey(desc *protocol.Desc) []byte {
-	if desc == nil || desc.Packet == nil {
+	if desc == nil {
 		return nil
 	}
 	// Inner fields: MACs (12B) + IPv6/IPv4 IPs (32B) + Proto (1B) + L4 Ports (4B)
@@ -142,7 +141,7 @@ func InnerFlowKey(desc *protocol.Desc) []byte {
 		fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST,
 	}
 	for _, num := range fields {
-		if f, err := desc.Packet.Field(fwdpacket.NewFieldIDFromNum(num, 1)); err == nil && len(f) > 0 {
+		if f, err := desc.PayloadField(fwdpacket.NewFieldIDFromNum(num, 0)); err == nil && len(f) > 0 {
 			key = append(key, f...)
 		}
 	}
