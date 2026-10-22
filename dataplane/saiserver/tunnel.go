@@ -68,9 +68,18 @@ func (t *tunnel) CreateTunnel(ctx context.Context, req *saipb.CreateTunnelReques
 	}
 
 	ttlMode := req.GetEncapTtlMode()
-	if ttlMode == saipb.TunnelTtlMode_TUNNEL_TTL_MODE_UNIFORM_MODEL { // Copy the TTL from the inner IP header.
+	switch ttlMode {
+	case saipb.TunnelTtlMode_TUNNEL_TTL_MODE_UNSPECIFIED, saipb.TunnelTtlMode_TUNNEL_TTL_MODE_UNIFORM_MODEL:
+		// Copy the TTL from the inner IP header.
 		actions = append(actions, fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_COPY, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).
 			WithFieldSrc(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithFieldSrcInstance(1)).Build())
+	case saipb.TunnelTtlMode_TUNNEL_TTL_MODE_PIPE_MODEL:
+		ttl := uint8(req.GetEncapTtlVal())
+		if ttl == 0 {
+			ttl = 64
+		}
+		actions = append(actions, fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).
+			WithValue([]byte{ttl})).Build())
 	}
 
 	if req.GetEncapSrcIp() != nil {
