@@ -16,19 +16,28 @@ package saiserver
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/openconfig/gnmi/errdiff"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"github.com/openconfig/lemming/dataplane/dplaneopts"
 	"github.com/openconfig/lemming/dataplane/forwarding/fwdconfig"
+	"github.com/openconfig/lemming/dataplane/forwarding/infra/fwdcontext"
 	saipb "github.com/openconfig/lemming/dataplane/proto/sai"
 	"github.com/openconfig/lemming/dataplane/saiserver/attrmgr"
 	fwdpb "github.com/openconfig/lemming/proto/forwarding"
@@ -1423,6 +1432,459 @@ func TestTunnelMapAndEntry(t *testing.T) {
 			t.Errorf("RemoveTunnelMapEntry for failed entry expected NotFound, got %v", err)
 		}
 	})
+}
+
+func TestCreateTunnelLoopbackUnderlay(t *testing.T) {
+	dplane := &fakeSwitchDataplane{}
+	c, mgr, stopFn := newTestTunnel(t, dplane)
+	defer stopFn()
+
+	// Register OID 20 as a LOOPBACK RIF in VRF 7.
+	mgr.SetType("20", saipb.ObjectType_OBJECT_TYPE_ROUTER_INTERFACE)
+	mgr.StoreAttributes(20, &saipb.RouterInterfaceAttribute{
+		Type:            saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK.Enum(),
+		VirtualRouterId: proto.Uint64(7),
+	})
+
+	_, err := c.CreateTunnel(context.TODO(), &saipb.CreateTunnelRequest{
+		Type:              saipb.TunnelType_TUNNEL_TYPE_VXLAN.Enum(),
+		UnderlayInterface: proto.Uint64(20),
+		EncapSrcIp:        net.ParseIP("10.10.10.1").To4(),
+		EncapTtlMode:      saipb.TunnelTtlMode_TUNNEL_TTL_MODE_PIPE_MODEL.Enum(),
+		EncapTtlVal:       proto.Uint32(64),
+	})
+	if err != nil {
+		t.Fatalf("CreateTunnel() unexpected err: %v", err)
+	}
+
+	got := dplane.gotEntryAddReqs[0]
+	want := &fwdpb.TableEntryAddRequest{
+		ContextId: &fwdpb.ContextId{Id: "foo"},
+		TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: TunnelEncap}},
+		Entries: []*fwdpb.TableEntryAddRequest_Entry{{
+			EntryDesc: fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TUNNEL_ID).WithUint64(1),
+			)).Build(),
+			Actions: []*fwdpb.ActionDesc{
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithValue([]byte{64})).Build(),
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_ADDR_SRC).WithValue(net.ParseIP("10.10.10.1").To4())).Build(),
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_L4_PORT_DST).WithUint64Value(4789)).Build(),
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_VRF).WithUint64Value(7)).Build(),
+				fwdconfig.Action(fwdconfig.LookupAction(FIBSelectorTable)).Build(),
+			},
+		}},
+	}
+	if d := cmp.Diff(got, want, protocmp.Transform()); d != "" {
+		t.Errorf("CreateTunnel(loopback underlay) failed: diff(-got,+want)\n%s", d)
+	}
+}
+
+type capturingFakePort struct {
+	txCh chan []byte
+	done chan struct{}
+	once sync.Once
+}
+
+func (p *capturingFakePort) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
+	<-p.done
+	return nil, gopacket.CaptureInfo{}, io.EOF
+}
+
+func (p *capturingFakePort) WritePacketData(data []byte) error {
+	cp := append([]byte(nil), data...)
+	select {
+	case p.txCh <- cp:
+	case <-p.done:
+	}
+	return nil
+}
+
+func (p *capturingFakePort) Close() {
+	p.once.Do(func() { close(p.done) })
+}
+
+type capturingFakePortMgr struct {
+	mu    sync.Mutex
+	ports map[string]*capturingFakePort
+}
+
+func (m *capturingFakePortMgr) CreatePort(name string) (fwdcontext.Port, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ports == nil {
+		m.ports = make(map[string]*capturingFakePort)
+	}
+	p := &capturingFakePort{
+		txCh: make(chan []byte, 16),
+		done: make(chan struct{}),
+	}
+	m.ports[name] = p
+	return p, nil
+}
+
+func (m *capturingFakePortMgr) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.ports {
+		p.Close()
+	}
+}
+
+func TestVXLANLoopbackUnderlayAndTTLPacket(t *testing.T) {
+	ctx := context.Background()
+	mgr := attrmgr.New()
+	grpcSrv := grpc.NewServer(grpc.UnaryInterceptor(mgr.Interceptor))
+	srv, err := New(ctx, mgr, grpcSrv, &dplaneopts.Options{PortType: fwdpb.PortType_PORT_TYPE_FAKE})
+	if err != nil {
+		t.Fatalf("saiserver.New() failed: %v", err)
+	}
+	fwdCtx, err := srv.FindContext(&fwdpb.ContextId{Id: srv.ID()})
+	if err != nil {
+		t.Fatalf("FindContext() failed: %v", err)
+	}
+	portMgr := &capturingFakePortMgr{}
+	fwdCtx.FakePortManager = portMgr
+	t.Cleanup(portMgr.Close)
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() failed: %v", err)
+	}
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+	t.Cleanup(grpcSrv.Stop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient() failed: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	swClient := saipb.NewSwitchClient(conn)
+	portClient := saipb.NewPortClient(conn)
+	vrClient := saipb.NewVirtualRouterClient(conn)
+	rifClient := saipb.NewRouterInterfaceClient(conn)
+	tunClient := saipb.NewTunnelClient(conn)
+	nhClient := saipb.NewNextHopClient(conn)
+	nhgClient := saipb.NewNextHopGroupClient(conn)
+	routeClient := saipb.NewRouteClient(conn)
+	neighClient := saipb.NewNeighborClient(conn)
+
+	swMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	port1MAC := net.HardwareAddr{0x02, 0x00, 0x01, 0x01, 0x01, 0x01}
+	port2MAC := net.HardwareAddr{0x02, 0x00, 0x02, 0x02, 0x02, 0x02}
+	ateMAC := net.HardwareAddr{0x02, 0x00, 0xaa, 0x00, 0x00, 0x01}
+	nhMAC := net.HardwareAddr{0x02, 0x00, 0xbb, 0x00, 0x00, 0x02}
+	tunMAC := net.HardwareAddr{0x02, 0x00, 0xaa, 0xbb, 0xcc, 0xdd}
+
+	swResp, err := swClient.CreateSwitch(ctx, &saipb.CreateSwitchRequest{
+		InitSwitch:    proto.Bool(true),
+		SrcMacAddress: swMAC,
+	})
+	if err != nil {
+		t.Fatalf("CreateSwitch() failed: %v", err)
+	}
+	swAttr, err := swClient.GetSwitchAttribute(ctx, &saipb.GetSwitchAttributeRequest{
+		Oid:      swResp.Oid,
+		AttrType: []saipb.SwitchAttr{saipb.SwitchAttr_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID},
+	})
+	if err != nil {
+		t.Fatalf("GetSwitchAttribute() failed: %v", err)
+	}
+	defaultVR := swAttr.GetAttr().GetDefaultVirtualRouterId()
+
+	p1Resp, err := portClient.CreatePort(ctx, &saipb.CreatePortRequest{
+		Switch:     swResp.Oid,
+		HwLaneList: []uint32{1},
+		AdminState: proto.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("CreatePort(1) failed: %v", err)
+	}
+	p2Resp, err := portClient.CreatePort(ctx, &saipb.CreatePortRequest{
+		Switch:     swResp.Oid,
+		HwLaneList: []uint32{2},
+		AdminState: proto.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("CreatePort(2) failed: %v", err)
+	}
+
+	overlayVRResp, err := vrClient.CreateVirtualRouter(ctx, &saipb.CreateVirtualRouterRequest{Switch: swResp.Oid})
+	if err != nil {
+		t.Fatalf("CreateVirtualRouter() failed: %v", err)
+	}
+
+	p1RifResp, err := rifClient.CreateRouterInterface(ctx, &saipb.CreateRouterInterfaceRequest{
+		Switch:          swResp.Oid,
+		Type:            saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_PORT.Enum(),
+		PortId:          proto.Uint64(p1Resp.Oid),
+		VirtualRouterId: proto.Uint64(overlayVRResp.Oid),
+		SrcMacAddress:   port1MAC,
+	})
+	if err != nil {
+		t.Fatalf("CreateRouterInterface(p1) failed: %v", err)
+	}
+	_ = p1RifResp
+
+	p2RifResp, err := rifClient.CreateRouterInterface(ctx, &saipb.CreateRouterInterfaceRequest{
+		Switch:          swResp.Oid,
+		Type:            saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_PORT.Enum(),
+		PortId:          proto.Uint64(p2Resp.Oid),
+		VirtualRouterId: proto.Uint64(defaultVR),
+		SrcMacAddress:   port2MAC,
+	})
+	if err != nil {
+		t.Fatalf("CreateRouterInterface(p2) failed: %v", err)
+	}
+
+	loRifResp, err := rifClient.CreateRouterInterface(ctx, &saipb.CreateRouterInterfaceRequest{
+		Switch:          swResp.Oid,
+		Type:            saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK.Enum(),
+		VirtualRouterId: proto.Uint64(defaultVR),
+	})
+	if err != nil {
+		t.Fatalf("CreateRouterInterface(lo) failed: %v", err)
+	}
+
+	tunPipeResp, err := tunClient.CreateTunnel(ctx, &saipb.CreateTunnelRequest{
+		Switch:            swResp.Oid,
+		Type:              saipb.TunnelType_TUNNEL_TYPE_VXLAN.Enum(),
+		UnderlayInterface: proto.Uint64(loRifResp.Oid),
+		EncapSrcIp:        net.ParseIP("10.10.10.1").To4(),
+		EncapTtlMode:      saipb.TunnelTtlMode_TUNNEL_TTL_MODE_PIPE_MODEL.Enum(),
+		EncapTtlVal:       proto.Uint32(64),
+	})
+	if err != nil {
+		t.Fatalf("CreateTunnel(pipe) failed: %v", err)
+	}
+
+	tunUniformResp, err := tunClient.CreateTunnel(ctx, &saipb.CreateTunnelRequest{
+		Switch:            swResp.Oid,
+		Type:              saipb.TunnelType_TUNNEL_TYPE_VXLAN.Enum(),
+		UnderlayInterface: proto.Uint64(loRifResp.Oid),
+		EncapSrcIp:        net.ParseIP("10.10.10.1").To4(),
+		EncapTtlMode:      saipb.TunnelTtlMode_TUNNEL_TTL_MODE_UNIFORM_MODEL.Enum(),
+	})
+	if err != nil {
+		t.Fatalf("CreateTunnel(uniform) failed: %v", err)
+	}
+
+	nhPipeResp, err := nhClient.CreateNextHop(ctx, &saipb.CreateNextHopRequest{
+		Switch:    swResp.Oid,
+		Type:      saipb.NextHopType_NEXT_HOP_TYPE_TUNNEL_ENCAP.Enum(),
+		TunnelId:  proto.Uint64(tunPipeResp.Oid),
+		Ip:        net.ParseIP("20.20.20.2").To4(),
+		TunnelVni: proto.Uint32(5000),
+		TunnelMac: tunMAC,
+	})
+	if err != nil {
+		t.Fatalf("CreateNextHop(pipe) failed: %v", err)
+	}
+
+	nhUniformResp, err := nhClient.CreateNextHop(ctx, &saipb.CreateNextHopRequest{
+		Switch:    swResp.Oid,
+		Type:      saipb.NextHopType_NEXT_HOP_TYPE_TUNNEL_ENCAP.Enum(),
+		TunnelId:  proto.Uint64(tunUniformResp.Oid),
+		Ip:        net.ParseIP("20.20.20.3").To4(),
+		TunnelVni: proto.Uint32(5001),
+		TunnelMac: tunMAC,
+	})
+	if err != nil {
+		t.Fatalf("CreateNextHop(uniform) failed: %v", err)
+	}
+
+	underlayNHResp, err := nhClient.CreateNextHop(ctx, &saipb.CreateNextHopRequest{
+		Switch:            swResp.Oid,
+		Type:              saipb.NextHopType_NEXT_HOP_TYPE_IP.Enum(),
+		RouterInterfaceId: proto.Uint64(p2RifResp.Oid),
+		Ip:                net.ParseIP("192.0.2.6").To4(),
+	})
+	if err != nil {
+		t.Fatalf("CreateNextHop(underlay) failed: %v", err)
+	}
+
+	if _, err := neighClient.CreateNeighborEntry(ctx, &saipb.CreateNeighborEntryRequest{
+		Entry: &saipb.NeighborEntry{
+			SwitchId:  swResp.Oid,
+			RifId:     p2RifResp.Oid,
+			IpAddress: net.ParseIP("192.0.2.6").To4(),
+		},
+		DstMacAddress: nhMAC,
+	}); err != nil {
+		t.Fatalf("CreateNeighborEntry() failed: %v", err)
+	}
+
+	nhgResp, err := nhgClient.CreateNextHopGroup(ctx, &saipb.CreateNextHopGroupRequest{
+		Switch:                  swResp.Oid,
+		Type:                    saipb.NextHopGroupType_NEXT_HOP_GROUP_TYPE_ECMP_WITH_MEMBERS.Enum(),
+		NextHopList:             []uint64{underlayNHResp.Oid},
+		NextHopMemberWeightList: []uint32{1},
+	})
+	if err != nil {
+		t.Fatalf("CreateNextHopGroup() failed: %v", err)
+	}
+
+	for _, ipStr := range []string{"20.20.20.2", "20.20.20.3"} {
+		if _, err := routeClient.CreateRouteEntry(ctx, &saipb.CreateRouteEntryRequest{
+			Entry: &saipb.RouteEntry{
+				SwitchId: swResp.Oid,
+				VrId:     defaultVR,
+				Destination: &saipb.IpPrefix{
+					Addr: net.ParseIP(ipStr).To4(),
+					Mask: []byte{0xff, 0xff, 0xff, 0xff},
+				},
+			},
+			PacketAction: saipb.PacketAction_PACKET_ACTION_FORWARD.Enum(),
+			NextHopId:    proto.Uint64(nhgResp.Oid),
+		}); err != nil {
+			t.Fatalf("CreateRouteEntry(underlay %s) failed: %v", ipStr, err)
+		}
+	}
+
+	for dstIP, nhID := range map[string]uint64{
+		"198.51.100.2": nhPipeResp.Oid,
+		"198.51.100.3": nhUniformResp.Oid,
+	} {
+		if _, err := routeClient.CreateRouteEntry(ctx, &saipb.CreateRouteEntryRequest{
+			Entry: &saipb.RouteEntry{
+				SwitchId: swResp.Oid,
+				VrId:     overlayVRResp.Oid,
+				Destination: &saipb.IpPrefix{
+					Addr: net.ParseIP(dstIP).To4(),
+					Mask: []byte{0xff, 0xff, 0xff, 0xff},
+				},
+			},
+			PacketAction: saipb.PacketAction_PACKET_ACTION_FORWARD.Enum(),
+			NextHopId:    proto.Uint64(nhID),
+		}); err != nil {
+			t.Fatalf("CreateRouteEntry(overlay %s) failed: %v", dstIP, err)
+		}
+	}
+
+	inject := func(dstMAC net.HardwareAddr, dstIP string, ttl uint8) {
+		buf := gopacket.NewSerializeBuffer()
+		opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+		ethL := &layers.Ethernet{SrcMAC: ateMAC, DstMAC: dstMAC, EthernetType: layers.EthernetTypeIPv4}
+		ipL := &layers.IPv4{Version: 4, TTL: ttl, Protocol: layers.IPProtocolUDP, SrcIP: net.ParseIP("192.0.2.2").To4(), DstIP: net.ParseIP(dstIP).To4()}
+		udpL := &layers.UDP{SrcPort: 12345, DstPort: 54321}
+		if err := udpL.SetNetworkLayerForChecksum(ipL); err != nil {
+			t.Fatalf("SetNetworkLayerForChecksum() failed: %v", err)
+		}
+		if err := gopacket.SerializeLayers(buf, opts,
+			ethL,
+			ipL,
+			udpL,
+			gopacket.Payload([]byte("hello-vxlan")),
+		); err != nil {
+			t.Fatalf("SerializeLayers() failed: %v", err)
+		}
+		if err := srv.InjectPacket(
+			&fwdpb.ContextId{Id: srv.ID()},
+			&fwdpb.PortId{ObjectId: &fwdpb.ObjectId{Id: fmt.Sprint(p1Resp.Oid)}},
+			fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET,
+			buf.Bytes(),
+			nil,
+			false,
+			fwdpb.PortAction_PORT_ACTION_INPUT,
+		); err != nil {
+			t.Fatalf("InjectPacket() failed: %v", err)
+		}
+	}
+
+	port2 := portMgr.ports["2"]
+	if port2 == nil {
+		t.Fatalf("port 2 not created in fake port manager")
+	}
+
+	// 1. MyMacTable miss -> dropped.
+	inject(net.HardwareAddr{0x02, 0x00, 0x99, 0x99, 0x99, 0x99}, "198.51.100.2", 64)
+	select {
+	case pkt := <-port2.txCh:
+		t.Fatalf("expected drop on MyMacTable miss, got packet of len %d", len(pkt))
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 2. Inner TTL=1 -> dropped by innerTTLCheckTable before encap.
+	inject(port1MAC, "198.51.100.2", 1)
+	select {
+	case pkt := <-port2.txCh:
+		t.Fatalf("expected drop on inner TTL=1, got packet of len %d", len(pkt))
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 2b. M-9: Inner TTL=2 -> forwarded with inner TTL=1 and outer PIPE TTL=64.
+	inject(port1MAC, "198.51.100.2", 2)
+	var ttl2Frame []byte
+	select {
+	case ttl2Frame = <-port2.txCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for PIPE_MODEL VXLAN packet with inner TTL=2")
+	}
+	ttl2Pkt := gopacket.NewPacket(ttl2Frame, layers.LayerTypeEthernet, gopacket.Default)
+	ttl2OuterIP := ttl2Pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	ttl2Vxlan := ttl2Pkt.Layer(layers.LayerTypeVXLAN).(*layers.VXLAN)
+	ttl2InnerIP := gopacket.NewPacket(ttl2Vxlan.LayerPayload(), layers.LayerTypeEthernet, gopacket.Default).Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if ttl2OuterIP.TTL != 64 || ttl2InnerIP.TTL != 1 {
+		t.Fatalf("TTL=2 case got outerTTL=%d innerTTL=%d, want outerTTL=64 innerTTL=1", ttl2OuterIP.TTL, ttl2InnerIP.TTL)
+	}
+
+	// 3. PIPE_MODEL: inner TTL 64 -> 63, outer TTL stays 64 (not decremented to 63).
+	inject(port1MAC, "198.51.100.2", 64)
+	var pipeFrame []byte
+	select {
+	case pipeFrame = <-port2.txCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for PIPE_MODEL VXLAN packet")
+	}
+	pipePkt := gopacket.NewPacket(pipeFrame, layers.LayerTypeEthernet, gopacket.Default)
+	outerIP, ok := pipePkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if !ok {
+		t.Fatalf("missing outer IPv4 layer in PIPE packet")
+	}
+	if !outerIP.SrcIP.Equal(net.ParseIP("10.10.10.1").To4()) || !outerIP.DstIP.Equal(net.ParseIP("20.20.20.2").To4()) {
+		t.Fatalf("unexpected outer IPs: src=%v dst=%v", outerIP.SrcIP, outerIP.DstIP)
+	}
+	if outerIP.TTL != 64 {
+		t.Fatalf("PIPE outer TTL = %d, want 64", outerIP.TTL)
+	}
+	vxlanL, ok := pipePkt.Layer(layers.LayerTypeVXLAN).(*layers.VXLAN)
+	if !ok || vxlanL.VNI != 5000 {
+		t.Fatalf("unexpected VXLAN layer: ok=%v vni=%v", ok, vxlanL)
+	}
+	innerPkt := gopacket.NewPacket(vxlanL.LayerPayload(), layers.LayerTypeEthernet, gopacket.Default)
+	innerIP, ok := innerPkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if !ok {
+		t.Fatalf("missing inner IPv4 layer in PIPE packet")
+	}
+	if innerIP.TTL != 63 {
+		t.Fatalf("PIPE inner TTL = %d, want 63", innerIP.TTL)
+	}
+	innerEth := innerPkt.Layer(layers.LayerTypeEthernet).(*layers.Ethernet)
+	if innerEth.DstMAC.String() != tunMAC.String() {
+		t.Fatalf("inner DstMAC = %s, want %s", innerEth.DstMAC, tunMAC)
+	}
+
+	// 4. UNIFORM_MODEL: inner TTL 64 -> 63, outer TTL copies decremented inner TTL (63).
+	inject(port1MAC, "198.51.100.3", 64)
+	var uniformFrame []byte
+	select {
+	case uniformFrame = <-port2.txCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for UNIFORM_MODEL VXLAN packet")
+	}
+	uPkt := gopacket.NewPacket(uniformFrame, layers.LayerTypeEthernet, gopacket.Default)
+	uOuterIP := uPkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if uOuterIP.TTL != 63 {
+		t.Fatalf("UNIFORM outer TTL = %d, want 63", uOuterIP.TTL)
+	}
+	uVxlan := uPkt.Layer(layers.LayerTypeVXLAN).(*layers.VXLAN)
+	uInnerPkt := gopacket.NewPacket(uVxlan.LayerPayload(), layers.LayerTypeEthernet, gopacket.Default)
+	uInnerIP := uInnerPkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
+	if uInnerIP.TTL != 63 {
+		t.Fatalf("UNIFORM inner TTL = %d, want 63", uInnerIP.TTL)
+	}
 }
 
 func newTestTunnel(t testing.TB, api switchDataplaneAPI) (saipb.TunnelClient, *attrmgr.AttrMgr, func()) {

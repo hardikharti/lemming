@@ -204,8 +204,8 @@ func (actions Actions) IsEqual(arg Actions) bool {
 	return true
 }
 
-// maxActions is the maxumum numbers of actions to perform on a packet.
-const maxActions = 100
+// maxActions is the maximum number of actions to perform on a packet.
+const maxActions = 256
 
 // evaluatePacket processes a network packet with a series of actions to
 // determine the state of the packet. It returns the next state and count of

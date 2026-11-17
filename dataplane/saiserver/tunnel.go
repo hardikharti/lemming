@@ -87,6 +87,19 @@ func newTunnel(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Serve
 	return t
 }
 
+func (t *tunnel) Reset() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.tunnelMaps = make(map[uint64]saipb.TunnelMapType)
+	t.mapEntries = make(map[uint64]map[uint64]*saipb.CreateTunnelMapEntryRequest)
+	t.entryToMap = make(map[uint64]uint64)
+	t.mapTunnels = make(map[uint64]map[uint64]struct{})
+	t.termKeys = make(map[string]uint64)
+}
+
 // CreateTunnel creates a new tunnel supporting IPinIP, GRE, and VXLAN tunnel types.
 func (t *tunnel) CreateTunnel(ctx context.Context, req *saipb.CreateTunnelRequest) (*saipb.CreateTunnelResponse, error) {
 	tunType := req.GetType()
@@ -159,11 +172,34 @@ func (t *tunnel) CreateTunnel(ctx context.Context, req *saipb.CreateTunnelReques
 	id := t.mgr.NextID()
 
 	under := req.GetUnderlayInterface()
+	isLoopbackUnderlay := false
+	var underlayVR uint64
+	if ty := t.mgr.GetType(fmt.Sprint(under)); ty == saipb.ObjectType_OBJECT_TYPE_ROUTER_INTERFACE ||
+		(ty == saipb.ObjectType_OBJECT_TYPE_NULL && t.mgr.GetAttribute(fmt.Sprint(under), int32(saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_TYPE)) != nil) {
+		rifAttr := &saipb.RouterInterfaceAttribute{}
+		if err := t.mgr.PopulateAllAttributes(fmt.Sprint(under), rifAttr); err == nil &&
+			rifAttr.GetType() == saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK {
+			isLoopbackUnderlay = true
+			underlayVR = rifAttr.GetVirtualRouterId()
+		}
+	}
+
+	var encapActions []*fwdpb.ActionDesc
+	if !isLoopbackUnderlay {
+		encapActions = append(encapActions, fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64Value(under)).Build())
+	}
+	encapActions = append(encapActions, actions...)
+	if isLoopbackUnderlay {
+		encapActions = append(encapActions,
+			fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_VRF).WithUint64Value(underlayVR)).Build(),
+			fwdconfig.Action(fwdconfig.LookupAction(FIBSelectorTable)).Build(),
+		)
+	}
+
 	entry := fwdconfig.TableEntryAddRequest(t.dataplane.ID(), TunnelEncap).AppendEntry(
 		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TUNNEL_ID).WithUint64(id))),
-		fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64Value(under),
 	).Build()
-	entry.Entries[0].Actions = append(entry.Entries[0].Actions, actions...)
+	entry.Entries[0].Actions = encapActions
 	if _, err := t.dataplane.TableEntryAdd(ctx, entry); err != nil {
 		return nil, err
 	}

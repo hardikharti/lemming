@@ -156,6 +156,7 @@ func (s *Server) Initialize(ctx context.Context, _ *saipb.InitializeRequest) (*s
 		slog.InfoContext(ctx, "dataplane already initialized, resetting")
 		s.mgr.Reset()
 		s.saiSwitch.Reset()
+		s.fdb.Reset()
 		if err := s.Reset(ctx); err != nil {
 			return nil, err
 		}
@@ -196,7 +197,7 @@ func New(ctx context.Context, mgr *attrmgr.AttrMgr, s *grpc.Server, opts *dplane
 		return nil, err
 	}
 
-	fdb, err := newFdb(mgr, fwdCtx, s)
+	fdb, err := newFdb(mgr, fwdCtx, s, sw.vlan)
 	if err != nil {
 		return nil, err
 	}

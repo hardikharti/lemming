@@ -624,6 +624,332 @@ func TestVXLANTunnelEncapDecap(t *testing.T) {
 	testTraffic(t, ate, ateTop, atePort1, atePort2)
 }
 
+func TestVXLANLoopbackUnderlayAndTTL(t *testing.T) {
+	ate := ondatra.ATE(t, "ate")
+	ateTop := configureATE(t, ate)
+	ate.OTG().PushConfig(t, ateTop)
+	ate.OTG().StartProtocols(t)
+
+	dut1 := ondatra.DUT(t, "dut1")
+	dut2 := ondatra.DUT(t, "dut2")
+
+	conn1 := dataplaneConn(t, dut1)
+	conn2 := dataplaneConn(t, dut2)
+
+	// Remove default wildcard MyMac entry on dut1 so we validate RIF macTracker directly,
+	// and restore it in cleanup so other tests are unaffected.
+	sc1 := saipb.NewSwitchClient(conn1)
+	mmc1 := saipb.NewMyMacClient(conn1)
+	swAttrs, err := sc1.GetSwitchAttribute(context.Background(), &saipb.GetSwitchAttributeRequest{
+		Oid:      1,
+		AttrType: []saipb.SwitchAttr{saipb.SwitchAttr_SWITCH_ATTR_MY_MAC_LIST},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, oid := range swAttrs.GetAttr().GetMyMacList() {
+		if _, err := mmc1.RemoveMyMac(context.Background(), &saipb.RemoveMyMacRequest{Oid: oid}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		if _, err := mmc1.CreateMyMac(context.Background(), &saipb.CreateMyMacRequest{
+			Switch:         1,
+			Priority:       proto.Uint32(1),
+			MacAddress:     []byte{0, 0, 0, 0, 0, 0},
+			MacAddressMask: []byte{0, 0, 0, 0, 0, 0},
+		}); err != nil {
+			t.Errorf("restore CreateMyMac failed: %v", err)
+		}
+	})
+
+	dut1OverlayVRF := createVirtualRouter(t, dut1)
+	dut2OverlayVRF := createVirtualRouter(t, dut2)
+
+	// dut1 interfaces: port1 in overlay VRF, port2 in underlay VRF 0, plus loopback RIF in VRF 0.
+	createRIF(t, dut1, "port1", dut1Port1.MAC, dut1OverlayVRF)
+	dut1Rif2 := createRIF(t, dut1, "port2", dut1Port2.MAC, 0)
+
+	ric1 := saipb.NewRouterInterfaceClient(conn1)
+	loResp, err := ric1.CreateRouterInterface(context.Background(), &saipb.CreateRouterInterfaceRequest{
+		Switch:          1,
+		Type:            saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK.Enum(),
+		VirtualRouterId: proto.Uint64(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := ric1.RemoveRouterInterface(context.Background(), &saipb.RemoveRouterInterfaceRequest{Oid: loResp.Oid}); err != nil {
+			t.Errorf("RemoveRouterInterface(LOOPBACK) failed: %v", err)
+		}
+	})
+
+	// dut2 interfaces: port1 in underlay VRF 0, port2 in overlay VRF.
+	dut2Rif1 := createRIF(t, dut2, "port1", dut2Port1.MAC, 0)
+	dut2Rif2 := createRIF(t, dut2, "port2", dut2Port2.MAC, dut2OverlayVRF)
+
+	// VXLAN tunnel on dut1 using loopback underlay and PIPE TTL=64.
+	tunClient1 := saipb.NewTunnelClient(conn1)
+	tunType := saipb.TunnelType_TUNNEL_TYPE_VXLAN
+	tunResp1, err := tunClient1.CreateTunnel(context.Background(), &saipb.CreateTunnelRequest{
+		Switch:            1,
+		Type:              &tunType,
+		UnderlayInterface: proto.Uint64(loResp.Oid),
+		EncapSrcIp:        net.ParseIP("10.10.10.1").To4(),
+		EncapTtlMode:      saipb.TunnelTtlMode_TUNNEL_TTL_MODE_PIPE_MODEL.Enum(),
+		EncapTtlVal:       proto.Uint32(64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := tunClient1.RemoveTunnel(context.Background(), &saipb.RemoveTunnelRequest{Oid: tunResp1.Oid}); err != nil {
+			t.Errorf("RemoveTunnel failed: %v", err)
+		}
+	})
+
+	tunnelMac, err := net.ParseMAC("02:00:aa:bb:cc:dd")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nhClient1 := saipb.NewNextHopClient(conn1)
+	nhResp1, err := nhClient1.CreateNextHop(context.Background(), &saipb.CreateNextHopRequest{
+		Switch:    1,
+		Type:      saipb.NextHopType_NEXT_HOP_TYPE_TUNNEL_ENCAP.Enum(),
+		TunnelId:  proto.Uint64(tunResp1.Oid),
+		Ip:        net.ParseIP("20.20.20.2").To4(),
+		TunnelVni: proto.Uint32(5000),
+		TunnelMac: tunnelMac,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := nhClient1.RemoveNextHop(context.Background(), &saipb.RemoveNextHopRequest{Oid: nhResp1.Oid}); err != nil {
+			t.Errorf("RemoveNextHop failed: %v", err)
+		}
+	})
+
+	// Underlay ECMP NextHopGroup -> NextHop(IP) via dut1Rif2 (gw 192.0.2.6).
+	underlayNHResp, err := nhClient1.CreateNextHop(context.Background(), &saipb.CreateNextHopRequest{
+		Switch:            1,
+		Type:              saipb.NextHopType_NEXT_HOP_TYPE_IP.Enum(),
+		RouterInterfaceId: proto.Uint64(dut1Rif2),
+		Ip:                net.ParseIP(dut2Port1.IPv4).To4(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := nhClient1.RemoveNextHop(context.Background(), &saipb.RemoveNextHopRequest{Oid: underlayNHResp.Oid}); err != nil {
+			t.Errorf("RemoveNextHop(underlay) failed: %v", err)
+		}
+	})
+
+	nhgClient1 := saipb.NewNextHopGroupClient(conn1)
+	nhgResp, err := nhgClient1.CreateNextHopGroup(context.Background(), &saipb.CreateNextHopGroupRequest{
+		Switch:                  1,
+		Type:                    saipb.NextHopGroupType_NEXT_HOP_GROUP_TYPE_ECMP_WITH_MEMBERS.Enum(),
+		NextHopList:             []uint64{underlayNHResp.Oid},
+		NextHopMemberWeightList: []uint32{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := nhgClient1.RemoveNextHopGroup(context.Background(), &saipb.RemoveNextHopGroupRequest{Oid: nhgResp.Oid}); err != nil {
+			t.Errorf("RemoveNextHopGroup failed: %v", err)
+		}
+	})
+
+	rc1 := saipb.NewRouteClient(conn1)
+	underlayRouteReq := &saipb.CreateRouteEntryRequest{
+		Entry: &saipb.RouteEntry{
+			SwitchId: 1,
+			VrId:     0,
+			Destination: &saipb.IpPrefix{
+				Addr: net.ParseIP("20.20.20.2").To4(),
+				Mask: []byte{0xFF, 0xFF, 0xFF, 0xFF},
+			},
+		},
+		PacketAction: saipb.PacketAction_PACKET_ACTION_FORWARD.Enum(),
+		NextHopId:    &nhgResp.Oid,
+	}
+	if _, err := rc1.CreateRouteEntry(context.Background(), underlayRouteReq); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := rc1.RemoveRouteEntry(context.Background(), &saipb.RemoveRouteEntryRequest{Entry: underlayRouteReq.Entry}); err != nil {
+			t.Errorf("RemoveRouteEntry(underlay) failed: %v", err)
+		}
+	})
+
+	overlayRouteReq := &saipb.CreateRouteEntryRequest{
+		Entry: &saipb.RouteEntry{
+			SwitchId: 1,
+			VrId:     dut1OverlayVRF,
+			Destination: &saipb.IpPrefix{
+				Addr: net.ParseIP(atePort2.IPv4).To4(),
+				Mask: []byte{0xFF, 0xFF, 0xFF, 0xFF},
+			},
+		},
+		PacketAction: saipb.PacketAction_PACKET_ACTION_FORWARD.Enum(),
+		NextHopId:    &nhResp1.Oid,
+	}
+	if _, err := rc1.CreateRouteEntry(context.Background(), overlayRouteReq); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := rc1.RemoveRouteEntry(context.Background(), &saipb.RemoveRouteEntryRequest{Entry: overlayRouteReq.Entry}); err != nil {
+			t.Errorf("RemoveRouteEntry(overlay) failed: %v", err)
+		}
+	})
+
+	nc1 := saipb.NewNeighborClient(conn1)
+	dut2Port1MAC, err := net.ParseMAC(dut2Port1.MAC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	neighReq1 := &saipb.CreateNeighborEntryRequest{
+		Entry: &saipb.NeighborEntry{
+			SwitchId:  1,
+			RifId:     dut1Rif2,
+			IpAddress: net.ParseIP(dut2Port1.IPv4).To4(),
+		},
+		DstMacAddress: dut2Port1MAC,
+	}
+	if _, err := nc1.CreateNeighborEntry(context.Background(), neighReq1); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := nc1.RemoveNeighborEntry(context.Background(), &saipb.RemoveNeighborEntryRequest{Entry: neighReq1.Entry}); err != nil {
+			t.Errorf("RemoveNeighborEntry failed: %v", err)
+		}
+	})
+
+	// Configure dut2 decap.
+	tunClient2 := saipb.NewTunnelClient(conn2)
+	mapResp, err := tunClient2.CreateTunnelMap(context.Background(), &saipb.CreateTunnelMapRequest{
+		Switch: 1,
+		Type:   saipb.TunnelMapType_TUNNEL_MAP_TYPE_VNI_TO_VIRTUAL_ROUTER_ID.Enum(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := tunClient2.RemoveTunnelMap(context.Background(), &saipb.RemoveTunnelMapRequest{Oid: mapResp.Oid}); err != nil {
+			t.Errorf("RemoveTunnelMap failed: %v", err)
+		}
+	})
+
+	tunResp2, err := tunClient2.CreateTunnel(context.Background(), &saipb.CreateTunnelRequest{
+		Switch:            1,
+		Type:              &tunType,
+		UnderlayInterface: proto.Uint64(dut2Rif1),
+		DecapMappers:      []uint64{mapResp.Oid},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := tunClient2.RemoveTunnel(context.Background(), &saipb.RemoveTunnelRequest{Oid: tunResp2.Oid}); err != nil {
+			t.Errorf("RemoveTunnel failed: %v", err)
+		}
+	})
+
+	termResp2, err := tunClient2.CreateTunnelTermTableEntry(context.Background(), &saipb.CreateTunnelTermTableEntryRequest{
+		Switch:         1,
+		Type:           saipb.TunnelTermTableEntryType_TUNNEL_TERM_TABLE_ENTRY_TYPE_P2MP.Enum(),
+		TunnelType:     &tunType,
+		DstIp:          net.ParseIP("20.20.20.2").To4(),
+		ActionTunnelId: proto.Uint64(tunResp2.Oid),
+		VrId:           proto.Uint64(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := tunClient2.RemoveTunnelTermTableEntry(context.Background(), &saipb.RemoveTunnelTermTableEntryRequest{Oid: termResp2.Oid}); err != nil {
+			t.Errorf("RemoveTunnelTermTableEntry failed: %v", err)
+		}
+	})
+
+	mapEntryResp, err := tunClient2.CreateTunnelMapEntry(context.Background(), &saipb.CreateTunnelMapEntryRequest{
+		Switch:               1,
+		TunnelMap:            proto.Uint64(mapResp.Oid),
+		VniIdKey:             proto.Uint32(5000),
+		VirtualRouterIdValue: proto.Uint64(dut2OverlayVRF),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := tunClient2.RemoveTunnelMapEntry(context.Background(), &saipb.RemoveTunnelMapEntryRequest{Oid: mapEntryResp.Oid}); err != nil {
+			t.Errorf("RemoveTunnelMapEntry failed: %v", err)
+		}
+	})
+
+	createConnectedRouteAndNeighbor(t, dut2, dut2Rif2, dut2OverlayVRF, fmt.Sprint(dut2Port2.IPv4, "/", dut2Port2.IPv4Len), atePort2.IPv4, atePort2.MAC)
+
+	flowIdx := 0
+	sendTraffic := func(dstMAC string, wantDelivered bool) {
+		flowIdx++
+		flowName := fmt.Sprintf("Flow-%d", flowIdx)
+		otg := ate.OTG()
+		ateTop.Flows().Clear().Items()
+
+		flow := ateTop.Flows().Add().SetName(flowName)
+		flow.Metrics().SetEnable(true)
+		flow.TxRx().Port().SetTxName(atePort1.Name).SetRxNames([]string{atePort2.Name})
+
+		txPkts := uint64(50)
+		flow.Rate().SetPps(100)
+		flow.Duration().FixedPackets().SetPackets(uint32(txPkts))
+
+		eth := flow.Packet().Add().Ethernet()
+		eth.Src().SetValue(atePort1.MAC)
+		eth.Dst().SetValue(dstMAC)
+
+		ip4 := flow.Packet().Add().Ipv4()
+		ip4.Src().SetValue(atePort1.IPv4)
+		ip4.Dst().SetValue(atePort2.IPv4)
+		ip4.Version().SetValue(4)
+
+		otg.PushConfig(t, ateTop)
+		otg.StartTraffic(t)
+		defer otg.StopTraffic(t)
+
+		gnmi.Await(t, otg, gnmi.OTG().Flow(flowName).Counters().OutPkts().State(), 5*time.Second, txPkts)
+		if wantDelivered {
+			gnmi.Await(t, otg, gnmi.OTG().Flow(flowName).Counters().InPkts().State(), 5*time.Second, txPkts)
+		} else {
+			time.Sleep(500 * time.Millisecond)
+			if val, ok := gnmi.Lookup(t, otg, gnmi.OTG().Flow(flowName).Counters().InPkts().State()).Val(); ok && val != 0 {
+				t.Fatalf("expected 0 rx packets for dstMAC=%s, got %d", dstMAC, val)
+			}
+		}
+	}
+
+	// 1. Send traffic with eth.Dst == dut1Port1.MAC -> 100% delivered over loopback underlay ECMP route.
+	sendTraffic(dut1Port1.MAC, true)
+
+	// 2. Verify packet with non-router dst MAC is dropped by MyMacTable.
+	sendTraffic("02:00:99:99:99:99", false)
+
+	// 3. Verify removing the underlay route drops tunneled traffic, and re-adding restores delivery.
+	if _, err := rc1.RemoveRouteEntry(context.Background(), &saipb.RemoveRouteEntryRequest{Entry: underlayRouteReq.Entry}); err != nil {
+		t.Fatalf("RemoveRouteEntry(underlay) failed: %v", err)
+	}
+	sendTraffic(dut1Port1.MAC, false)
+
+	if _, err := rc1.CreateRouteEntry(context.Background(), underlayRouteReq); err != nil {
+		t.Fatalf("CreateRouteEntry(underlay) failed: %v", err)
+	}
+	sendTraffic(dut1Port1.MAC, true)
+}
+
 // configureATE configures port1 and port2 on the ATE.
 func configureATE(t *testing.T, ate *ondatra.ATEDevice) gosnappi.Config {
 	top := gosnappi.NewConfig()

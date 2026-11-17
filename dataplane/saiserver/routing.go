@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -511,7 +512,11 @@ func (nh *nextHop) CreateNextHop(ctx context.Context, req *saipb.CreateNextHopRe
 		if len(req.Ip) == 4 {
 			headerID = fwdpb.PacketHeaderId_PACKET_HEADER_ID_IP4
 		}
-		actions = []*fwdpb.ActionDesc{}
+		actions = []*fwdpb.ActionDesc{
+			fwdconfig.Action(fwdconfig.LookupAction(innerTTLCheckTable)).Build(),
+			fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_8).
+				WithFieldIDInstance(skipOuterTTLDecAttr).WithValue([]byte{0x01})).Build(),
+		}
 
 		switch tunnel.GetAttr().GetType() {
 		case saipb.TunnelType_TUNNEL_TYPE_IPINIP:
@@ -1014,19 +1019,262 @@ func (r *route) RemoveRouteEntries(ctx context.Context, re *saipb.RemoveRouteEnt
 	return resp, errs.Err()
 }
 
-type routerInterface struct {
-	saipb.UnimplementedRouterInterfaceServer
-	mgr       *attrmgr.AttrMgr
-	dataplane switchDataplaneAPI
+type vlanRIFInfo struct {
+	rifID      uint64
+	vlanOID    uint64
+	vid        uint32
+	inCounter  string
+	outCounter string
 }
 
-func newRouterInterface(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Server) *routerInterface {
+type routerInterface struct {
+	saipb.UnimplementedRouterInterfaceServer
+	mgr        *attrmgr.AttrMgr
+	dataplane  switchDataplaneAPI
+	macTracker *macTracker
+	vlan       *vlan
+	mu         sync.Mutex
+	vlanRIFs   map[uint64]*vlanRIFInfo
+	vlanToRIFs map[uint64]map[uint64]struct{}
+}
+
+func newRouterInterface(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Server, tracker *macTracker, vlan *vlan) *routerInterface {
 	r := &routerInterface{
-		mgr:       mgr,
-		dataplane: dataplane,
+		mgr:        mgr,
+		dataplane:  dataplane,
+		macTracker: tracker,
+		vlan:       vlan,
+		vlanRIFs:   make(map[uint64]*vlanRIFInfo),
+		vlanToRIFs: make(map[uint64]map[uint64]struct{}),
 	}
 	saipb.RegisterRouterInterfaceServer(s, r)
 	return r
+}
+
+func (ri *routerInterface) Reset() {
+	if ri == nil {
+		return
+	}
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	ri.vlanRIFs = make(map[uint64]*vlanRIFInfo)
+	ri.vlanToRIFs = make(map[uint64]map[uint64]struct{})
+}
+
+func (ri *routerInterface) resolveVlanID(vlanOID uint64) (uint32, error) {
+	if ri.vlan != nil {
+		if vid, err := ri.vlan.vidByOid(vlanOID); err == nil {
+			return vid, nil
+		}
+	}
+	vResp := &saipb.GetVlanAttributeResponse{}
+	if err := ri.mgr.PopulateAttributes(&saipb.GetVlanAttributeRequest{
+		Oid:      vlanOID,
+		AttrType: []saipb.VlanAttr{saipb.VlanAttr_VLAN_ATTR_VLAN_ID},
+	}, vResp); err == nil && vResp.GetAttr().VlanId != nil {
+		return vResp.GetAttr().GetVlanId(), nil
+	}
+	return 0, status.Errorf(codes.NotFound, "VLAN %d not found", vlanOID)
+}
+
+func vlanMemberMatchTag(vid uint32, mode saipb.VlanTaggingMode) uint16 {
+	if mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+		return uint16(vid)
+	}
+	return 0
+}
+
+func (ri *routerInterface) programVlanMemberInput(ctx context.Context, info *vlanRIFInfo, m *vlanMember) error {
+	nid, err := ri.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
+		ContextId: &fwdpb.ContextId{Id: ri.dataplane.ID()},
+		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(m.PortID)},
+	})
+	if err != nil {
+		return err
+	}
+	tag := vlanMemberMatchTag(info.vid, m.Mode)
+	inReq := fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), inputIfaceTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid()),
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithBytes(binary.BigEndian.AppendUint16(nil, tag)),
+			)),
+			fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_INPUT_IFACE).WithUint64Value(info.rifID),
+			fwdconfig.FlowCounterAction(info.inCounter),
+		).Build()
+	if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+		inReq.Entries[0].Actions = append(inReq.Entries[0].Actions, &fwdpb.ActionDesc{
+			ActionType: fwdpb.ActionType_ACTION_TYPE_DECAP,
+			Action: &fwdpb.ActionDesc_Decap{
+				Decap: &fwdpb.DecapActionDesc{
+					HeaderId: fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN,
+				},
+			},
+		})
+	}
+	_, err = ri.dataplane.TableEntryAdd(ctx, inReq)
+	return err
+}
+
+func (ri *routerInterface) removeVlanMemberInput(ctx context.Context, vid uint32, m *vlanMember) error {
+	nid, err := ri.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
+		ContextId: &fwdpb.ContextId{Id: ri.dataplane.ID()},
+		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(m.PortID)},
+	})
+	if err != nil {
+		return err
+	}
+	tag := vlanMemberMatchTag(vid, m.Mode)
+	_, err = ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), inputIfaceTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid()),
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithBytes(binary.BigEndian.AppendUint16(nil, tag)),
+			)),
+		).Build())
+	return err
+}
+
+func (ri *routerInterface) programVlanMemberEgressTag(ctx context.Context, vid uint32, portID uint64) error {
+	req := fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), egressVlanTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16).
+					WithBytes(binary.BigEndian.AppendUint16(nil, uint16(vid))),
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT).WithUint64(portID),
+			)),
+			fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN),
+			fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithValue(binary.BigEndian.AppendUint16(nil, uint16(vid))),
+		).Build()
+	_, err := ri.dataplane.TableEntryAdd(ctx, req)
+	return err
+}
+
+func (ri *routerInterface) removeVlanMemberEgressTag(ctx context.Context, vid uint32, portID uint64) error {
+	_, err := ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), egressVlanTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16).
+					WithBytes(binary.BigEndian.AppendUint16(nil, uint16(vid))),
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT).WithUint64(portID),
+			)),
+		).Build())
+	return err
+}
+
+func (ri *routerInterface) updateVlanOutputIface(ctx context.Context, info *vlanRIFInfo, members []*vlanMember) error {
+	outActions := []fwdconfig.ActionDescBuilder{
+		fwdconfig.FlowCounterAction(info.outCounter),
+		fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16).
+			WithFieldIDInstance(egressVlanAttr).
+			WithValue(binary.BigEndian.AppendUint16(nil, uint16(info.vid))),
+	}
+	outReq := fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), outputIfaceTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64(info.rifID))),
+			outActions...,
+		).Build()
+	if _, err := ri.dataplane.TableEntryAdd(ctx, outReq); err != nil {
+		return err
+	}
+
+	var floodActions []fwdconfig.ActionDescBuilder
+	switch len(members) {
+	case 0:
+		floodActions = append(floodActions, fwdconfig.DropAction())
+	case 1:
+		floodActions = append(floodActions,
+			fwdconfig.TransmitAction(fmt.Sprint(members[0].PortID)),
+			fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT).WithUint64Value(members[0].PortID),
+		)
+	default:
+		for _, m := range members[:len(members)-1] {
+			ma := fwdconfig.MirrorAction().WithPort(fmt.Sprint(m.PortID), fwdpb.PortAction_PORT_ACTION_WRITE)
+			if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+				ma.WithActions(
+					fwdconfig.Action(fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN)),
+					fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).
+						WithValue(binary.BigEndian.AppendUint16(nil, uint16(info.vid)))),
+				)
+			}
+			floodActions = append(floodActions, ma)
+		}
+		last := members[len(members)-1]
+		floodActions = append(floodActions,
+			fwdconfig.TransmitAction(fmt.Sprint(last.PortID)),
+			fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT).WithUint64Value(last.PortID),
+		)
+	}
+	floodReq := fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), vlanFloodTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+				fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16).
+					WithBytes(binary.BigEndian.AppendUint16(nil, uint16(info.vid))),
+			)),
+			floodActions...,
+		).Build()
+	_, err := ri.dataplane.TableEntryAdd(ctx, floodReq)
+	return err
+}
+
+func (ri *routerInterface) getVlanRIFInfos(vlanOID uint64) []*vlanRIFInfo {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	var infos []*vlanRIFInfo
+	for rifID := range ri.vlanToRIFs[vlanOID] {
+		if info, ok := ri.vlanRIFs[rifID]; ok {
+			infos = append(infos, info)
+		}
+	}
+	slices.SortFunc(infos, func(a, b *vlanRIFInfo) int {
+		if a.rifID < b.rifID {
+			return -1
+		}
+		if a.rifID > b.rifID {
+			return 1
+		}
+		return 0
+	})
+	return infos
+}
+
+func (ri *routerInterface) onVlanMemberAdded(ctx context.Context, vlanOID uint64, m *vlanMember, members []*vlanMember) error {
+	if ri == nil {
+		return nil
+	}
+	for _, info := range ri.getVlanRIFInfos(vlanOID) {
+		if err := ri.programVlanMemberInput(ctx, info, m); err != nil {
+			return err
+		}
+		if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+			if err := ri.programVlanMemberEgressTag(ctx, info.vid, m.PortID); err != nil {
+				return err
+			}
+		}
+		if err := ri.updateVlanOutputIface(ctx, info, members); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ri *routerInterface) onVlanMemberRemoved(ctx context.Context, vlanOID uint64, m *vlanMember, remainingMembers []*vlanMember) {
+	if ri == nil {
+		return
+	}
+	for _, info := range ri.getVlanRIFInfos(vlanOID) {
+		if err := ri.removeVlanMemberInput(ctx, info.vid, m); err != nil {
+			slog.WarnContext(ctx, "failed to remove inputIfaceTable entry for VLAN member", "err", err)
+		}
+		if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+			if err := ri.removeVlanMemberEgressTag(ctx, info.vid, m.PortID); err != nil {
+				slog.WarnContext(ctx, "failed to remove egressVlanTable entry for VLAN member", "err", err)
+			}
+		}
+		if err := ri.updateVlanOutputIface(ctx, info, remainingMembers); err != nil {
+			slog.WarnContext(ctx, "failed to update outputIfaceTable entry for VLAN RIF", "err", err)
+		}
+	}
 }
 
 func ifaceCounterID(oid uint64, input bool) string {
@@ -1045,8 +1293,99 @@ func (ri *routerInterface) CreateRouterInterface(ctx context.Context, req *saipb
 	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_PORT:
 	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_SUB_PORT:
 		vlanID = uint16(req.GetOuterVlanId())
-	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK: // TODO: Support loopback interfaces
-		slog.WarnContext(ctx, "loopback interfaces not supported")
+	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK:
+		if err := ri.macTracker.acquire(ctx, req.GetSrcMacAddress()); err != nil {
+			return nil, err
+		}
+		return &saipb.CreateRouterInterfaceResponse{Oid: id}, nil
+	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_VLAN:
+		vlanOID := req.GetVlanId()
+		vid, err := ri.resolveVlanID(vlanOID)
+		if err != nil {
+			return nil, err
+		}
+		inCounter := ifaceCounterID(id, true)
+		outCounter := ifaceCounterID(id, false)
+		if _, err := ri.dataplane.FlowCounterCreate(ctx, &fwdpb.FlowCounterCreateRequest{
+			ContextId: &fwdpb.ContextId{Id: ri.dataplane.ID()},
+			Id:        &fwdpb.FlowCounterId{ObjectId: &fwdpb.ObjectId{Id: inCounter}},
+		}); err != nil {
+			return nil, err
+		}
+		if _, err := ri.dataplane.FlowCounterCreate(ctx, &fwdpb.FlowCounterCreateRequest{
+			ContextId: &fwdpb.ContextId{Id: ri.dataplane.ID()},
+			Id:        &fwdpb.FlowCounterId{ObjectId: &fwdpb.ObjectId{Id: outCounter}},
+		}); err != nil {
+			return nil, err
+		}
+
+		info := &vlanRIFInfo{
+			rifID:      id,
+			vlanOID:    vlanOID,
+			vid:        vid,
+			inCounter:  inCounter,
+			outCounter: outCounter,
+		}
+		// Register before snapshotting members so concurrent CreateVlanMember calls cannot be missed.
+		ri.mu.Lock()
+		ri.vlanRIFs[id] = info
+		if ri.vlanToRIFs[vlanOID] == nil {
+			ri.vlanToRIFs[vlanOID] = make(map[uint64]struct{})
+		}
+		ri.vlanToRIFs[vlanOID][id] = struct{}{}
+		ri.mu.Unlock()
+
+		rollbackVlanRIF := func() {
+			ri.mu.Lock()
+			delete(ri.vlanRIFs, id)
+			if rifs := ri.vlanToRIFs[vlanOID]; rifs != nil {
+				delete(rifs, id)
+				if len(rifs) == 0 {
+					delete(ri.vlanToRIFs, vlanOID)
+				}
+			}
+			ri.mu.Unlock()
+		}
+
+		var members []*vlanMember
+		if ri.vlan != nil {
+			members = ri.vlan.membersForVlan(vlanOID)
+		}
+		for _, m := range members {
+			if err := ri.programVlanMemberInput(ctx, info, m); err != nil {
+				rollbackVlanRIF()
+				return nil, err
+			}
+			if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+				if err := ri.programVlanMemberEgressTag(ctx, info.vid, m.PortID); err != nil {
+					rollbackVlanRIF()
+					return nil, err
+				}
+			}
+		}
+		if err := ri.updateVlanOutputIface(ctx, info, members); err != nil {
+			rollbackVlanRIF()
+			return nil, err
+		}
+		if _, err := ri.dataplane.TableEntryAdd(ctx, fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), IngressVRFTable).
+			AppendEntry(
+				fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_INPUT_IFACE).WithUint64(id))),
+				fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_VRF).WithUint64Value(req.GetVirtualRouterId()),
+			).Build()); err != nil {
+			rollbackVlanRIF()
+			return nil, err
+		}
+		if _, err := ri.dataplane.TableEntryAdd(ctx, fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), SRCMACTable).AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64(id))),
+			fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_ETHER_MAC_SRC).WithValue(req.GetSrcMacAddress()),
+		).Build()); err != nil {
+			rollbackVlanRIF()
+			return nil, err
+		}
+		if err := ri.macTracker.acquire(ctx, req.GetSrcMacAddress()); err != nil {
+			rollbackVlanRIF()
+			return nil, err
+		}
 		return &saipb.CreateRouterInterfaceResponse{Oid: id}, nil
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unknown interface type: %v", req.GetType())
@@ -1114,7 +1453,7 @@ func (ri *routerInterface) CreateRouterInterface(ctx context.Context, req *saipb
 		).Build()
 
 	if vlanID != 0 {
-		outReq.Entries[0].Actions = append(inReq.Entries[0].Actions,
+		outReq.Entries[0].Actions = append(outReq.Entries[0].Actions,
 			fwdconfig.Action(fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN)).Build(),
 			fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithValue(binary.BigEndian.AppendUint16(nil, vlanID))).Build(),
 		)
@@ -1144,6 +1483,10 @@ func (ri *routerInterface) CreateRouterInterface(ctx context.Context, req *saipb
 		return nil, err
 	}
 
+	if err := ri.macTracker.acquire(ctx, req.GetSrcMacAddress()); err != nil {
+		return nil, err
+	}
+
 	return &saipb.CreateRouterInterfaceResponse{Oid: id}, nil
 }
 
@@ -1151,28 +1494,120 @@ func (ri *routerInterface) RemoveRouterInterface(ctx context.Context, req *saipb
 	resp := &saipb.GetRouterInterfaceAttributeResponse{}
 	err := ri.mgr.PopulateAttributes(&saipb.GetRouterInterfaceAttributeRequest{
 		Oid:      req.GetOid(),
-		AttrType: []saipb.RouterInterfaceAttr{saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_PORT_ID, saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_TYPE},
+		AttrType: []saipb.RouterInterfaceAttr{saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_TYPE},
 	}, resp)
 	if err != nil {
 		return nil, err
 	}
 
+	allAttr := &saipb.RouterInterfaceAttribute{}
+	if err := ri.mgr.PopulateAllAttributes(fmt.Sprint(req.GetOid()), allAttr); err != nil {
+		return nil, err
+	}
+
+	switch resp.GetAttr().GetType() {
+	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK:
+		if err := ri.macTracker.release(ctx, allAttr.GetSrcMacAddress()); err != nil {
+			slog.WarnContext(ctx, "failed to remove MyMacTable entry for RouterInterface", "err", err)
+		}
+		return &saipb.RemoveRouterInterfaceResponse{}, nil
+
+	case saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_VLAN:
+		ri.mu.Lock()
+		info := ri.vlanRIFs[req.GetOid()]
+		lastOnVlan := false
+		if info != nil {
+			delete(ri.vlanRIFs, req.GetOid())
+			if rifs := ri.vlanToRIFs[info.vlanOID]; rifs != nil {
+				delete(rifs, req.GetOid())
+				if len(rifs) == 0 {
+					delete(ri.vlanToRIFs, info.vlanOID)
+					lastOnVlan = true
+				}
+			}
+		}
+		ri.mu.Unlock()
+
+		vlanOID := allAttr.GetVlanId()
+		var vid uint32
+		if info != nil {
+			vlanOID = info.vlanOID
+			vid = info.vid
+		} else {
+			vid, _ = ri.resolveVlanID(vlanOID)
+		}
+
+		if ri.vlan != nil {
+			for _, m := range ri.vlan.membersForVlan(vlanOID) {
+				if err := ri.removeVlanMemberInput(ctx, vid, m); err != nil {
+					slog.WarnContext(ctx, "failed to remove inputIfaceTable entry for VLAN RouterInterface", "err", err)
+				}
+				if m.Mode == saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+					if err := ri.removeVlanMemberEgressTag(ctx, vid, m.PortID); err != nil {
+						slog.WarnContext(ctx, "failed to remove egressVlanTable entry for VLAN RouterInterface", "err", err)
+					}
+				}
+			}
+		}
+		if lastOnVlan {
+			if _, err := ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), vlanFloodTable).
+				AppendEntry(
+					fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+						fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16).
+							WithBytes(binary.BigEndian.AppendUint16(nil, uint16(vid))),
+					)),
+				).Build()); err != nil {
+				slog.WarnContext(ctx, "failed to remove vlanFloodTable entry for RouterInterface", "err", err)
+			}
+		}
+
+		if _, err := ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), outputIfaceTable).
+			AppendEntry(
+				fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64(req.GetOid()))),
+			).Build()); err != nil {
+			slog.WarnContext(ctx, "failed to remove outputIfaceTable entry for RouterInterface", "err", err)
+		}
+		if _, err := ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), IngressVRFTable).
+			AppendEntry(
+				fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_INPUT_IFACE).WithUint64(req.GetOid()))),
+			).Build()); err != nil {
+			slog.WarnContext(ctx, "failed to remove IngressVRFTable entry for RouterInterface", "err", err)
+		}
+		if _, err := ri.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(ri.dataplane.ID(), SRCMACTable).AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64(req.GetOid()))),
+		).Build()); err != nil {
+			slog.WarnContext(ctx, "failed to remove SRCMACTable entry for RouterInterface", "err", err)
+		}
+		if err := ri.macTracker.release(ctx, allAttr.GetSrcMacAddress()); err != nil {
+			slog.WarnContext(ctx, "failed to remove MyMacTable entry for RouterInterface", "err", err)
+		}
+		return &saipb.RemoveRouterInterfaceResponse{}, nil
+	}
+
+	portResp := &saipb.GetRouterInterfaceAttributeResponse{}
+	if err := ri.mgr.PopulateAttributes(&saipb.GetRouterInterfaceAttributeRequest{
+		Oid:      req.GetOid(),
+		AttrType: []saipb.RouterInterfaceAttr{saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_PORT_ID},
+	}, portResp); err != nil {
+		return nil, err
+	}
+
 	var vlanID uint16
 	if resp.GetAttr().GetType() == saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_SUB_PORT {
-		resp := &saipb.GetRouterInterfaceAttributeResponse{}
+		vlanResp := &saipb.GetRouterInterfaceAttributeResponse{}
 		err := ri.mgr.PopulateAttributes(&saipb.GetRouterInterfaceAttributeRequest{
 			Oid:      req.GetOid(),
 			AttrType: []saipb.RouterInterfaceAttr{saipb.RouterInterfaceAttr_ROUTER_INTERFACE_ATTR_OUTER_VLAN_ID},
-		}, resp)
+		}, vlanResp)
 		if err != nil {
 			return nil, err
 		}
-		vlanID = uint16(resp.GetAttr().GetOuterVlanId())
+		vlanID = uint16(vlanResp.GetAttr().GetOuterVlanId())
 	}
 
 	nid, err := ri.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
 		ContextId: &fwdpb.ContextId{Id: ri.dataplane.ID()},
-		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(resp.GetAttr().GetPortId())},
+		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(portResp.GetAttr().GetPortId())},
 	})
 	if err != nil {
 		return nil, err
@@ -1214,10 +1649,39 @@ func (ri *routerInterface) RemoveRouterInterface(ctx context.Context, req *saipb
 		slog.WarnContext(ctx, "failed to remove SRCMACTable entry for RouterInterface", "err", err)
 	}
 
+	if err := ri.macTracker.release(ctx, allAttr.GetSrcMacAddress()); err != nil {
+		slog.WarnContext(ctx, "failed to remove MyMacTable entry for RouterInterface", "err", err)
+	}
+
 	return &saipb.RemoveRouterInterfaceResponse{}, nil
 }
 
-func (ri *routerInterface) SetRouterInterfaceAttribute(context.Context, *saipb.SetRouterInterfaceAttributeRequest) (*saipb.SetRouterInterfaceAttributeResponse, error) {
+func (ri *routerInterface) SetRouterInterfaceAttribute(ctx context.Context, req *saipb.SetRouterInterfaceAttributeRequest) (*saipb.SetRouterInterfaceAttributeResponse, error) {
+	if req.SrcMacAddress != nil {
+		ri.mu.Lock()
+		defer ri.mu.Unlock()
+		if !ri.mgr.Exists(fmt.Sprint(req.GetOid())) {
+			return nil, status.Errorf(codes.NotFound, "router interface %d not found", req.GetOid())
+		}
+		oldAttr := &saipb.RouterInterfaceAttribute{}
+		if err := ri.mgr.PopulateAllAttributes(fmt.Sprint(req.GetOid()), oldAttr); err != nil {
+			return nil, err
+		}
+		if oldAttr.GetType() != saipb.RouterInterfaceType_ROUTER_INTERFACE_TYPE_LOOPBACK {
+			if _, err := ri.dataplane.TableEntryAdd(ctx, fwdconfig.TableEntryAddRequest(ri.dataplane.ID(), SRCMACTable).AppendEntry(
+				fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_OUTPUT_IFACE).WithUint64(req.GetOid()))),
+				fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_ETHER_MAC_SRC).WithValue(req.GetSrcMacAddress()),
+			).Build()); err != nil {
+				return nil, err
+			}
+		}
+		if err := ri.macTracker.replace(ctx, oldAttr.GetSrcMacAddress(), req.GetSrcMacAddress()); err != nil {
+			return nil, err
+		}
+		ri.mgr.StoreAttributes(req.GetOid(), &saipb.RouterInterfaceAttribute{
+			SrcMacAddress: req.SrcMacAddress,
+		})
+	}
 	return &saipb.SetRouterInterfaceAttributeResponse{}, nil
 }
 
@@ -1292,6 +1756,7 @@ type vlan struct {
 	saipb.UnimplementedVlanServer
 	mgr       *attrmgr.AttrMgr
 	dataplane switchDataplaneAPI
+	ri        *routerInterface
 	oidByVId  map[uint32]uint64                 // VID -> VLAN_OID
 	vlans     map[uint64]map[uint64]*vlanMember // VLAN_OID -> VLAN_Member_OID (port)
 }
@@ -1308,6 +1773,8 @@ func newVlan(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Server)
 }
 
 func (vlan *vlan) vidByOid(oid uint64) (uint32, error) {
+	vlan.mu.Lock()
+	defer vlan.mu.Unlock()
 	for v, o := range vlan.oidByVId {
 		if o == oid {
 			return v, nil
@@ -1316,10 +1783,37 @@ func (vlan *vlan) vidByOid(oid uint64) (uint32, error) {
 	return 0, fmt.Errorf("cannot find VLAN with OID %d", oid)
 }
 
-func (vlan *vlan) memberByOid(oid uint64) *vlanMember {
+func (vlan *vlan) membersForVlanLocked(vlanOID uint64) []*vlanMember {
+	membersMap := vlan.vlans[vlanOID]
+	members := make([]*vlanMember, 0, len(membersMap))
+	for _, m := range membersMap {
+		cp := *m
+		members = append(members, &cp)
+	}
+	slices.SortFunc(members, func(a, b *vlanMember) int {
+		if a.Oid < b.Oid {
+			return -1
+		}
+		if a.Oid > b.Oid {
+			return 1
+		}
+		return 0
+	})
+	return members
+}
+
+func (vlan *vlan) membersForVlan(vlanOID uint64) []*vlanMember {
+	vlan.mu.Lock()
+	defer vlan.mu.Unlock()
+	return vlan.membersForVlanLocked(vlanOID)
+}
+
+func (vlan *vlan) untaggedMemberByPortId(oid uint64) *vlanMember {
+	vlan.mu.Lock()
+	defer vlan.mu.Unlock()
 	for _, v := range vlan.vlans {
-		for mOid, member := range v {
-			if mOid == oid {
+		for _, member := range v {
+			if member.PortID == oid && member.Mode != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
 				return member
 			}
 		}
@@ -1327,17 +1821,15 @@ func (vlan *vlan) memberByOid(oid uint64) *vlanMember {
 	return nil
 }
 
-func (vlan *vlan) memberByPortId(oid uint64) *vlanMember {
+func (vlan *vlan) hasMember(vlanOID, portID uint64) bool {
 	vlan.mu.Lock()
 	defer vlan.mu.Unlock()
-	for _, v := range vlan.vlans {
-		for _, member := range v {
-			if member.PortID == oid {
-				return member
-			}
+	for _, m := range vlan.vlans[vlanOID] {
+		if m.PortID == portID {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func (vlan *vlan) oidByVid(vid uint32) (uint64, bool) {
@@ -1376,8 +1868,10 @@ func (vlan *vlan) CreateVlan(ctx context.Context, r *saipb.CreateVlanRequest) (*
 		TamObject:                          []uint64{},
 	}
 	vlan.mgr.StoreAttributes(id, attrs)
+	vlan.mu.Lock()
 	vlan.vlans[id] = map[uint64]*vlanMember{}
 	vlan.oidByVId[r.GetVlanId()] = id
+	vlan.mu.Unlock()
 	return &saipb.CreateVlanResponse{
 		Oid: id,
 	}, nil
@@ -1441,13 +1935,17 @@ func (vlan *vlan) CreateVlanMember(ctx context.Context, r *saipb.CreateVlanMembe
 	}
 
 	portID := bpAttrResp.GetAttr().GetPortId()
+	if vlan.hasMember(vOid, portID) {
+		return nil, status.Errorf(codes.AlreadyExists, "port %d is already a member of vlan %d", portID, vOid)
+	}
 
-	// For the case where this port was assigned to a prior vlan, store the
-	// vlan member to remove it from cache later.
-	member := vlan.memberByPortId(portID)
+	// Only untagged ports have a single default/native VLAN and migrate between VLANs.
+	var prevUntagged *vlanMember
+	if r.GetVlanTaggingMode() != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+		prevUntagged = vlan.untaggedMemberByPortId(portID)
+	}
 
 	mOid := vlan.mgr.NextID()
-	vlan.mgr.SetType(fmt.Sprint(mOid), saipb.ObjectType_OBJECT_TYPE_VLAN_MEMBER)
 	nid, err := vlan.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
 		ContextId: &fwdpb.ContextId{Id: vlan.dataplane.ID()},
 		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(portID)},
@@ -1456,62 +1954,120 @@ func (vlan *vlan) CreateVlanMember(ctx context.Context, r *saipb.CreateVlanMembe
 		slog.InfoContext(ctx, "Failed to find NID for port", "port_id", portID, "err", err)
 		return nil, err
 	}
-	vlanReq := fwdconfig.TableEntryAddRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
-		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build()
-	if r.GetVlanTaggingMode() != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
-		vlanReq.Entries[0].Actions = []*fwdpb.ActionDesc{
-			fwdconfig.Action(fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN)).Build(),
-			fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithUint64Value(uint64(vId))).Build(),
-		}
-	}
-	if _, err := vlan.dataplane.TableEntryAdd(ctx, vlanReq); err != nil {
-		return nil, err
-	}
-	// Update the attributes and internal data.
+
 	vlanAttrReq := &saipb.GetVlanAttributeRequest{Oid: vOid, AttrType: []saipb.VlanAttr{saipb.VlanAttr_VLAN_ATTR_MEMBER_LIST}}
 	vlanAttrResp := &saipb.GetVlanAttributeResponse{}
 	if err := vlan.mgr.PopulateAttributes(vlanAttrReq, vlanAttrResp); err != nil {
 		return nil, err
 	}
+	oldMemberList := slices.Clone(vlanAttrResp.GetAttr().GetMemberList())
+
+	// Evict prior untagged membership BEFORE programming/adding the new VLAN member so
+	// onVlanMemberRemoved on prevUntagged never removes the inputIfaceTable binding for the new VLAN's RIF.
+	var preVlanOid uint64
+	var oldPreMemberList []uint64
+	if prevUntagged != nil {
+		preVlanOid, _ = vlan.oidByVid(prevUntagged.Vid)
+		preAttrReq := &saipb.GetVlanAttributeRequest{Oid: preVlanOid, AttrType: []saipb.VlanAttr{saipb.VlanAttr_VLAN_ATTR_MEMBER_LIST}}
+		preAttrResp := &saipb.GetVlanAttributeResponse{}
+		if err := vlan.mgr.PopulateAttributes(preAttrReq, preAttrResp); err != nil {
+			return nil, err
+		}
+		oldPreMemberList = slices.Clone(preAttrResp.GetAttr().GetMemberList())
+		newMemList := make([]uint64, 0, len(oldPreMemberList))
+		for _, i := range oldPreMemberList {
+			if i != prevUntagged.Oid {
+				newMemList = append(newMemList, i)
+			}
+		}
+		preAttrResp.GetAttr().MemberList = newMemList
+		vlan.mgr.StoreAttributes(preVlanOid, preAttrResp.GetAttr())
+		vlan.mu.Lock()
+		delete(vlan.vlans[preVlanOid], prevUntagged.Oid)
+		oldRemaining := vlan.membersForVlanLocked(preVlanOid)
+		vlan.mu.Unlock()
+		if vlan.ri != nil {
+			vlan.ri.onVlanMemberRemoved(ctx, preVlanOid, prevUntagged, oldRemaining)
+		}
+	}
+
+	restorePrevUntagged := func(restoreVlanTable bool) {
+		if prevUntagged == nil {
+			return
+		}
+		if restoreVlanTable {
+			restoreReq := fwdconfig.TableEntryAddRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
+				fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build()
+			restoreReq.Entries[0].Actions = []*fwdpb.ActionDesc{
+				fwdconfig.Action(fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN)).Build(),
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithUint64Value(uint64(prevUntagged.Vid))).Build(),
+			}
+			_, _ = vlan.dataplane.TableEntryAdd(ctx, restoreReq)
+		}
+		vlan.mgr.StoreAttributes(preVlanOid, &saipb.VlanAttribute{MemberList: oldPreMemberList})
+		vlan.mu.Lock()
+		vlan.vlans[preVlanOid][prevUntagged.Oid] = prevUntagged
+		restoredMembers := vlan.membersForVlanLocked(preVlanOid)
+		vlan.mu.Unlock()
+		if vlan.ri != nil {
+			_ = vlan.ri.onVlanMemberAdded(ctx, preVlanOid, prevUntagged, restoredMembers)
+		}
+	}
+
+	// Program VlanTable when adding an untagged member or the first tagged membership
+	// (so an untagged native VLAN entry is not overwritten by subsequent tagged memberships).
+	programVlanTable := r.GetVlanTaggingMode() != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED || vlan.untaggedMemberByPortId(portID) == nil
+	if programVlanTable {
+		vlanReq := fwdconfig.TableEntryAddRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build()
+		if r.GetVlanTaggingMode() != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+			vlanReq.Entries[0].Actions = []*fwdpb.ActionDesc{
+				fwdconfig.Action(fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET_VLAN)).Build(),
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_SET, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_VLAN_TAG).WithUint64Value(uint64(vId))).Build(),
+			}
+		}
+		if _, err := vlan.dataplane.TableEntryAdd(ctx, vlanReq); err != nil {
+			restorePrevUntagged(false)
+			return nil, err
+		}
+	}
+	// Update the attributes and internal data.
 	vlanAttrResp.GetAttr().MemberList = append(vlanAttrResp.GetAttr().MemberList, mOid)
 	vlan.mgr.StoreAttributes(vOid, vlanAttrResp.GetAttr())
-	vlan.mu.Lock()
-	vlan.vlans[vOid][mOid] = &vlanMember{
+	newMember := &vlanMember{
 		Oid:          mOid,
 		PortID:       portID,
 		Vid:          vId,
 		Mode:         r.GetVlanTaggingMode(),
 		BridgePortID: r.GetBridgePortId(),
 	}
+	vlan.mu.Lock()
+	vlan.vlans[vOid][mOid] = newMember
+	newMembers := vlan.membersForVlanLocked(vOid)
 	vlan.mu.Unlock()
 
-	// Fetch the original vlan from the old vlan member and remove the member from that vlan
-	if member != nil {
-		preVlanOid, _ := vlan.oidByVid(member.Vid)
-		vlanAttrReq = &saipb.GetVlanAttributeRequest{Oid: preVlanOid, AttrType: []saipb.VlanAttr{saipb.VlanAttr_VLAN_ATTR_MEMBER_LIST}}
-		vlanAttrResp = &saipb.GetVlanAttributeResponse{}
-		if err := vlan.mgr.PopulateAttributes(vlanAttrReq, vlanAttrResp); err != nil {
+	if vlan.ri != nil {
+		if err := vlan.ri.onVlanMemberAdded(ctx, vOid, newMember, newMembers); err != nil {
+			vlan.mu.Lock()
+			delete(vlan.vlans[vOid], mOid)
+			vlan.mu.Unlock()
+			vlan.mgr.StoreAttributes(vOid, &saipb.VlanAttribute{MemberList: oldMemberList})
+			if prevUntagged != nil {
+				restorePrevUntagged(programVlanTable)
+			} else if programVlanTable {
+				_, _ = vlan.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
+					fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build())
+			}
 			return nil, err
 		}
-		newMemList := []uint64{}
-		for _, i := range vlanAttrResp.Attr.GetMemberList() {
-			if i != member.Oid {
-				newMemList = append(newMemList, i)
-			}
-		}
-		vlanAttrResp.GetAttr().MemberList = newMemList
-		vlan.mgr.StoreAttributes(preVlanOid, vlanAttrResp.GetAttr())
-		// Update internal map.
-		vlan.mu.Lock()
-		delete(vlan.vlans[preVlanOid], member.Oid)
-		vlan.mu.Unlock()
 	}
+
+	vlan.mgr.SetType(fmt.Sprint(mOid), saipb.ObjectType_OBJECT_TYPE_VLAN_MEMBER)
 	return &saipb.CreateVlanMemberResponse{Oid: mOid}, nil
 }
 
 func (vlan *vlan) RemoveVlanMember(ctx context.Context, r *saipb.RemoveVlanMemberRequest) (*saipb.RemoveVlanMemberResponse, error) {
 	vlan.mu.Lock()
-	defer vlan.mu.Unlock()
 
 	var member *vlanMember
 	var targetVlanOid uint64
@@ -1519,7 +2075,8 @@ func (vlan *vlan) RemoveVlanMember(ctx context.Context, r *saipb.RemoveVlanMembe
 
 	for vlanOid, members := range vlan.vlans {
 		if m, ok := members[r.GetOid()]; ok {
-			member = m
+			cp := *m
+			member = &cp
 			targetVlanOid = vlanOid
 			found = true
 			break
@@ -1527,22 +2084,34 @@ func (vlan *vlan) RemoveVlanMember(ctx context.Context, r *saipb.RemoveVlanMembe
 	}
 
 	if !found {
+		vlan.mu.Unlock()
 		return nil, fmt.Errorf("cannot find member with OID %d", r.GetOid())
 	}
-	nid, err := vlan.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
-		ContextId: &fwdpb.ContextId{Id: vlan.dataplane.ID()},
-		ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(member.PortID)},
-	})
-	if err != nil {
-		slog.InfoContext(ctx, "Failed to find NID for port", "bridge_port", member.PortID, "err", err)
-		return nil, err
-	}
-	if _, err := vlan.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
-		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build()); err != nil {
-		return nil, err
+	vlan.mu.Unlock()
+
+	if member.Mode != saipb.VlanTaggingMode_VLAN_TAGGING_MODE_TAGGED {
+		nid, err := vlan.dataplane.ObjectNID(ctx, &fwdpb.ObjectNIDRequest{
+			ContextId: &fwdpb.ContextId{Id: vlan.dataplane.ID()},
+			ObjectId:  &fwdpb.ObjectId{Id: fmt.Sprint(member.PortID)},
+		})
+		if err != nil {
+			slog.InfoContext(ctx, "Failed to find NID for port", "bridge_port", member.PortID, "err", err)
+			return nil, err
+		}
+		if _, err := vlan.dataplane.TableEntryRemove(ctx, fwdconfig.TableEntryRemoveRequest(vlan.dataplane.ID(), VlanTable).AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_PORT_INPUT).WithUint64(nid.GetNid())))).Build()); err != nil {
+			return nil, err
+		}
 	}
 
+	vlan.mu.Lock()
 	delete(vlan.vlans[targetVlanOid], r.GetOid())
+	remaining := vlan.membersForVlanLocked(targetVlanOid)
+	vlan.mu.Unlock()
+
+	if vlan.ri != nil {
+		vlan.ri.onVlanMemberRemoved(ctx, targetVlanOid, member, remaining)
+	}
 
 	return &saipb.RemoveVlanMemberResponse{}, nil
 }
@@ -1696,30 +2265,59 @@ func (h *hash) CreateHash(_ context.Context, req *saipb.CreateHashRequest) (*sai
 
 type virtualRouter struct {
 	saipb.UnimplementedVirtualRouterServer
-	mgr       *attrmgr.AttrMgr
-	dataplane switchDataplaneAPI
+	mgr        *attrmgr.AttrMgr
+	dataplane  switchDataplaneAPI
+	macTracker *macTracker
+	mu         sync.Mutex
 }
 
-func newVirtualRouter(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Server) *virtualRouter {
+func newVirtualRouter(mgr *attrmgr.AttrMgr, dataplane switchDataplaneAPI, s *grpc.Server, tracker *macTracker) *virtualRouter {
 	vr := &virtualRouter{
-		mgr:       mgr,
-		dataplane: dataplane,
+		mgr:        mgr,
+		dataplane:  dataplane,
+		macTracker: tracker,
 	}
 	saipb.RegisterVirtualRouterServer(s, vr)
 	return vr
 }
 
-func (vr *virtualRouter) CreateVirtualRouter(context.Context, *saipb.CreateVirtualRouterRequest) (*saipb.CreateVirtualRouterResponse, error) {
+func (vr *virtualRouter) CreateVirtualRouter(ctx context.Context, req *saipb.CreateVirtualRouterRequest) (*saipb.CreateVirtualRouterResponse, error) {
 	id := vr.mgr.NextID()
+	if err := vr.macTracker.acquire(ctx, req.GetSrcMacAddress()); err != nil {
+		return nil, err
+	}
 
 	return &saipb.CreateVirtualRouterResponse{Oid: id}, nil
 }
 
-func (vr *virtualRouter) RemoveVirtualRouter(context.Context, *saipb.RemoveVirtualRouterRequest) (*saipb.RemoveVirtualRouterResponse, error) {
+func (vr *virtualRouter) RemoveVirtualRouter(ctx context.Context, req *saipb.RemoveVirtualRouterRequest) (*saipb.RemoveVirtualRouterResponse, error) {
+	attr := &saipb.VirtualRouterAttribute{}
+	if err := vr.mgr.PopulateAllAttributes(fmt.Sprint(req.GetOid()), attr); err == nil {
+		if err := vr.macTracker.release(ctx, attr.GetSrcMacAddress()); err != nil {
+			slog.WarnContext(ctx, "failed to remove MyMacTable entry for VirtualRouter", "err", err)
+		}
+	}
 	return &saipb.RemoveVirtualRouterResponse{}, nil
 }
 
-func (vr *virtualRouter) SetVirtualRouterAttribute(context.Context, *saipb.SetVirtualRouterAttributeRequest) (*saipb.SetVirtualRouterAttributeResponse, error) {
+func (vr *virtualRouter) SetVirtualRouterAttribute(ctx context.Context, req *saipb.SetVirtualRouterAttributeRequest) (*saipb.SetVirtualRouterAttributeResponse, error) {
+	if req.SrcMacAddress != nil {
+		vr.mu.Lock()
+		defer vr.mu.Unlock()
+		if !vr.mgr.Exists(fmt.Sprint(req.GetOid())) {
+			return nil, status.Errorf(codes.NotFound, "virtual router %d not found", req.GetOid())
+		}
+		oldAttr := &saipb.VirtualRouterAttribute{}
+		if err := vr.mgr.PopulateAllAttributes(fmt.Sprint(req.GetOid()), oldAttr); err != nil {
+			return nil, err
+		}
+		if err := vr.macTracker.replace(ctx, oldAttr.GetSrcMacAddress(), req.GetSrcMacAddress()); err != nil {
+			return nil, err
+		}
+		vr.mgr.StoreAttributes(req.GetOid(), &saipb.VirtualRouterAttribute{
+			SrcMacAddress: req.SrcMacAddress,
+		})
+	}
 	return &saipb.SetVirtualRouterAttributeResponse{}, nil
 }
 

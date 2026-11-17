@@ -55,14 +55,26 @@ type AttrMgr struct {
 func deleteOID(mgr *AttrMgr, oid string) error {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
-	if _, ok := mgr.attrs[oid]; !ok {
+	_, hasAttrs := mgr.attrs[oid]
+	_, hasType := mgr.idToType[oid]
+	if !hasAttrs && !hasType {
 		return fmt.Errorf("OID not found: %s", oid)
 	}
 	delete(mgr.attrs, oid)
+	delete(mgr.idToType, oid)
 	if oid == mgr.switchID {
 		mgr.switchID = ""
 	}
 	return nil
+}
+
+// Exists reports whether the given OID currently exists in AttrMgr (via attributes or a non-NULL object type).
+func (mgr *AttrMgr) Exists(id string) bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	_, hasAttrs := mgr.attrs[id]
+	ty, hasType := mgr.idToType[id]
+	return hasAttrs || (hasType && ty != saipb.ObjectType_OBJECT_TYPE_NULL)
 }
 
 // New returns a new AttrMgr.

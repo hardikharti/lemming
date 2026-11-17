@@ -779,7 +779,7 @@ func entryDescFromReq(m *myMac, req *saipb.CreateMyMacRequest) (*fwdpb.EntryDesc
 		Entry: &fwdpb.EntryDesc_Flow{
 			Flow: &fwdpb.FlowEntryDesc{
 				Priority: req.GetPriority(),
-				Bank:     1,
+				Bank:     0,
 			},
 		},
 	}

@@ -15,15 +15,20 @@
 package saiserver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/openconfig/lemming/dataplane/dplaneopts"
@@ -68,6 +73,8 @@ type saiSwitch struct {
 	rpf             *rpfGroup
 	wred            *wred
 	mgr             *attrmgr.AttrMgr
+	macTracker      *macTracker
+	mu              sync.Mutex
 }
 
 type switchDataplaneAPI interface {
@@ -196,14 +203,152 @@ const (
 	invalidIngress        = "invalid-ingress"
 	invalidIngressV4Table = "invalid-ingress-v4"
 	invalidIngressV6Table = "invalid-ingress-v6"
+	innerTTLCheckTable    = "inner-ttl-check"
+	ttlDecTable           = "ttl-dec-table"
+	fdbTable              = "fdb-table"
+	vlanFloodTable        = "vlan-flood"
+	egressVlanTable       = "egress-vlan"
 	outputTable           = "output-table"
 	DefaultVlanId         = 1
+
+	skipOuterTTLDecAttr = 0 // Instance of PACKET_FIELD_NUM_PACKET_ATTRIBUTE_8
+	egressVlanAttr      = 0 // Instance of PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16
 )
+
+type macTracker struct {
+	mu        sync.Mutex
+	dataplane switchDataplaneAPI
+	opts      *dplaneopts.Options
+	refs      map[[6]byte]int
+}
+
+func newMacTracker(dataplane switchDataplaneAPI, opts *dplaneopts.Options) *macTracker {
+	return &macTracker{
+		dataplane: dataplane,
+		opts:      opts,
+		refs:      make(map[[6]byte]int),
+	}
+}
+
+func isValidRouterMAC(mac []byte) ([6]byte, bool) {
+	var key [6]byte
+	if len(mac) != 6 {
+		return key, false
+	}
+	copy(key[:], mac)
+	if key == [6]byte{} {
+		return key, false
+	}
+	return key, true
+}
+
+func (m *macTracker) Reset() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refs = make(map[[6]byte]int)
+}
+
+func (m *macTracker) acquire(ctx context.Context, mac []byte) error {
+	if m == nil {
+		return nil
+	}
+	key, ok := isValidRouterMAC(mac)
+	if !ok {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.refs[key] == 0 {
+		req := &fwdpb.TableEntryAddRequest{
+			ContextId: &fwdpb.ContextId{Id: m.dataplane.ID()},
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: MyMacTable}},
+			EntryDesc: &fwdpb.EntryDesc{
+				Entry: &fwdpb.EntryDesc_Flow{
+					Flow: &fwdpb.FlowEntryDesc{
+						Priority: math.MaxUint32 - 1,
+						Bank:     0,
+						Fields: []*fwdpb.PacketFieldMaskedBytes{
+							fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_ETHER_MAC_DST).
+								WithBytes(key[:], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}).Build(),
+						},
+					},
+				},
+			},
+			Actions: getL3Pipeline(m.opts.SkipIPValidation),
+		}
+		if _, err := m.dataplane.TableEntryAdd(ctx, req); err != nil {
+			return err
+		}
+	}
+	m.refs[key]++
+	return nil
+}
+
+func (m *macTracker) release(ctx context.Context, mac []byte) error {
+	if m == nil {
+		return nil
+	}
+	key, ok := isValidRouterMAC(mac)
+	if !ok {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cnt := m.refs[key]
+	if cnt == 0 {
+		return nil
+	}
+	if cnt == 1 {
+		req := &fwdpb.TableEntryRemoveRequest{
+			ContextId: &fwdpb.ContextId{Id: m.dataplane.ID()},
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: MyMacTable}},
+			EntryDesc: &fwdpb.EntryDesc{
+				Entry: &fwdpb.EntryDesc_Flow{
+					Flow: &fwdpb.FlowEntryDesc{
+						Priority: math.MaxUint32 - 1,
+						Bank:     0,
+						Fields: []*fwdpb.PacketFieldMaskedBytes{
+							fwdconfig.PacketFieldMaskedBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_ETHER_MAC_DST).
+								WithBytes(key[:], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}).Build(),
+						},
+					},
+				},
+			},
+		}
+		if _, err := m.dataplane.TableEntryRemove(ctx, req); err != nil {
+			return err
+		}
+		delete(m.refs, key)
+		return nil
+	}
+	m.refs[key] = cnt - 1
+	return nil
+}
+
+func (m *macTracker) replace(ctx context.Context, oldMAC, newMAC []byte) error {
+	if bytes.Equal(oldMAC, newMAC) {
+		return nil
+	}
+	if err := m.acquire(ctx, newMAC); err != nil {
+		return err
+	}
+	if err := m.release(ctx, oldMAC); err != nil {
+		_ = m.release(ctx, newMAC)
+		return err
+	}
+	return nil
+}
 
 func newSwitch(mgr *attrmgr.AttrMgr, engine switchDataplaneAPI, s *grpc.Server, opts *dplaneopts.Options) (*saiSwitch, error) {
 	dplane := &luciusTrace{switchDataplaneAPI: engine, tracer: otel.Tracer("lucius")}
 
+	tracker := newMacTracker(dplane, opts)
 	vlan := newVlan(mgr, dplane, s)
+	ri := newRouterInterface(mgr, engine, s, tracker, vlan)
+	vlan.ri = ri
 	q := newQueue(mgr, dplane, s)
 	sg := newSchedulerGroup(mgr, dplane, s)
 	port, err := newPort(mgr, dplane, s, vlan, q, sg, opts)
@@ -230,19 +375,20 @@ func newSwitch(mgr *attrmgr.AttrMgr, engine switchDataplaneAPI, s *grpc.Server, 
 		nextHopGroup:    newNextHopGroup(mgr, engine, s),
 		nextHop:         newNextHop(mgr, engine, s),
 		route:           newRoute(mgr, engine, s),
-		routerInterface: newRouterInterface(mgr, engine, s),
+		routerInterface: ri,
 		Lag:             newLAG(mgr, engine, s),
 		tunnel:          newTunnel(mgr, engine, s),
 		udf:             newUdf(mgr, engine, s),
 		scheduler:       newScheduler(mgr, engine, s),
 		qosMap:          newQOSMap(mgr, engine, s),
-		virtualRouter:   newVirtualRouter(mgr, engine, s),
+		virtualRouter:   newVirtualRouter(mgr, engine, s, tracker),
 		rpf:             newRpfGroup(mgr, engine, s),
 		buffer:          newBuffer(mgr, engine, s),
 		wred:            newWRED(mgr, engine, s),
 		queue:           q,
 		sg:              sg,
 		mgr:             mgr,
+		macTracker:      tracker,
 	}
 	saipb.RegisterSwitchServer(s, sw)
 	saipb.RegisterStpServer(s, sw.stp)
@@ -255,7 +401,7 @@ func (sw *saiSwitch) RemoveSwitch(ctx context.Context, req *saipb.RemoveSwitchRe
 }
 
 // CreateSwitch a creates a new switch and populates its default values.
-func (sw *saiSwitch) CreateSwitch(ctx context.Context, _ *saipb.CreateSwitchRequest) (*saipb.CreateSwitchResponse, error) {
+func (sw *saiSwitch) CreateSwitch(ctx context.Context, req *saipb.CreateSwitchRequest) (*saipb.CreateSwitchResponse, error) {
 	if id, err := sw.mgr.GetUint64SwitchID(); err == nil {
 		slog.InfoContext(ctx, "Using existing switch id", "id", id)
 		return &saipb.CreateSwitchResponse{
@@ -793,6 +939,16 @@ func (sw *saiSwitch) CreateSwitch(ctx context.Context, _ *saipb.CreateSwitchRequ
 		return nil, err
 	}
 
+	err = sw.createInnerTTLCheckTable(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	err = sw.createFDBAndEgressVlanTables(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	err = sw.createOutputTable(ctx, fmt.Sprint(cpuPortID))
 	if err != nil {
 		return nil, err
@@ -813,6 +969,11 @@ func (sw *saiSwitch) CreateSwitch(ctx context.Context, _ *saipb.CreateSwitchRequ
 	}
 	if _, err := sw.dataplane.TableCreate(ctx, myMAC); err != nil {
 		return nil, err
+	}
+	if len(req.GetSrcMacAddress()) > 0 {
+		if err := sw.macTracker.acquire(ctx, req.GetSrcMacAddress()); err != nil {
+			return nil, err
+		}
 	}
 
 	stpResp, err := attrmgr.InvokeAndSave(ctx, sw.mgr, sw.stp.CreateStp, &saipb.CreateStpRequest{
@@ -970,6 +1131,9 @@ func (sw *saiSwitch) CreateSwitch(ctx context.Context, _ *saipb.CreateSwitchRequ
 		},
 		AvailableSwitchIngressDropCounters: proto.Uint32(2),
 	}
+	if req.SrcMacAddress != nil {
+		attrs.SrcMacAddress = req.SrcMacAddress
+	}
 	sw.mgr.StoreAttributes(swID, attrs)
 	return &saipb.CreateSwitchResponse{
 		Oid: swID,
@@ -1107,8 +1271,154 @@ func (sw *saiSwitch) createInvalidPacketFilter(ctx context.Context) error {
 	return nil
 }
 
+func (sw *saiSwitch) createInnerTTLCheckTable(ctx context.Context) error {
+	_, err := sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
+		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
+		Desc: &fwdpb.TableDesc{
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: innerTTLCheckTable}},
+			TableType: fwdpb.TableType_TABLE_TYPE_EXACT,
+			Actions: []*fwdpb.ActionDesc{
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_DEC, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithValue([]byte{0x1})).Build(),
+			},
+			Table: &fwdpb.TableDesc_Exact{
+				Exact: &fwdpb.ExactTableDesc{
+					FieldIds: []*fwdpb.PacketFieldId{{
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP,
+						},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	req := fwdconfig.TableEntryAddRequest(sw.dataplane.ID(), innerTTLCheckTable).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithBytes([]byte{0x00}))),
+			fwdconfig.DropAction(),
+		).
+		AppendEntry(
+			fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithBytes([]byte{0x01}))),
+			fwdconfig.DropAction(),
+		).Build()
+	if _, err := sw.dataplane.TableEntryAdd(ctx, req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (sw *saiSwitch) createFDBAndEgressVlanTables(ctx context.Context) error {
+	if _, err := sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
+		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
+		Desc: &fwdpb.TableDesc{
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: vlanFloodTable}},
+			TableType: fwdpb.TableType_TABLE_TYPE_EXACT,
+			Actions:   []*fwdpb.ActionDesc{{ActionType: fwdpb.ActionType_ACTION_TYPE_CONTINUE}},
+			Table: &fwdpb.TableDesc_Exact{
+				Exact: &fwdpb.ExactTableDesc{
+					FieldIds: []*fwdpb.PacketFieldId{{
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16,
+							Instance: egressVlanAttr,
+						},
+					}},
+				},
+			},
+		},
+	}); err != nil {
+		return err
+	}
+
+	_, err := sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
+		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
+		Desc: &fwdpb.TableDesc{
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: fdbTable}},
+			TableType: fwdpb.TableType_TABLE_TYPE_EXACT,
+			Actions:   []*fwdpb.ActionDesc{fwdconfig.Action(fwdconfig.LookupAction(vlanFloodTable)).Build()},
+			Table: &fwdpb.TableDesc_Exact{
+				Exact: &fwdpb.ExactTableDesc{
+					FieldIds: []*fwdpb.PacketFieldId{{
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16,
+							Instance: egressVlanAttr,
+						},
+					}, {
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_ETHER_MAC_DST,
+						},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	_, err = sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
+		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
+		Desc: &fwdpb.TableDesc{
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: egressVlanTable}},
+			TableType: fwdpb.TableType_TABLE_TYPE_EXACT,
+			Actions:   []*fwdpb.ActionDesc{{ActionType: fwdpb.ActionType_ACTION_TYPE_CONTINUE}},
+			Table: &fwdpb.TableDesc_Exact{
+				Exact: &fwdpb.ExactTableDesc{
+					FieldIds: []*fwdpb.PacketFieldId{{
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_16,
+							Instance: egressVlanAttr,
+						},
+					}, {
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT,
+						},
+					}},
+				},
+			},
+		},
+	})
+	return err
+}
+
 func (sw *saiSwitch) createOutputTable(ctx context.Context, cpuPortID string) error {
 	_, err := sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
+		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
+		Desc: &fwdpb.TableDesc{
+			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: ttlDecTable}},
+			TableType: fwdpb.TableType_TABLE_TYPE_EXACT,
+			Actions: []*fwdpb.ActionDesc{
+				fwdconfig.Action(fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_DEC, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithValue([]byte{0x1})).Build(),
+			},
+			Table: &fwdpb.TableDesc_Exact{
+				Exact: &fwdpb.ExactTableDesc{
+					FieldIds: []*fwdpb.PacketFieldId{{
+						Field: &fwdpb.PacketField{
+							FieldNum: fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_8,
+							Instance: skipOuterTTLDecAttr,
+						},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	ttlDecReq := fwdconfig.TableEntryAddRequest(sw.dataplane.ID(), ttlDecTable).AppendEntry(
+		fwdconfig.EntryDesc(fwdconfig.ExactEntry(
+			fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ATTRIBUTE_8).
+				WithBytes([]byte{0x01}),
+		)),
+		fwdconfig.ContinueAction(),
+	).Build()
+	if _, err := sw.dataplane.TableEntryAdd(ctx, ttlDecReq); err != nil {
+		return err
+	}
+
+	_, err = sw.dataplane.TableCreate(ctx, &fwdpb.TableCreateRequest{
 		ContextId: &fwdpb.ContextId{Id: sw.dataplane.ID()},
 		Desc: &fwdpb.TableDesc{
 			TableId:   &fwdpb.TableId{ObjectId: &fwdpb.ObjectId{Id: outputTable}},
@@ -1134,23 +1444,27 @@ func (sw *saiSwitch) createOutputTable(ctx context.Context, cpuPortID string) er
 	).AppendEntry(
 		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ACTION).WithBytes([]byte{1}))), // FORWARD
 		fwdconfig.DecapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),                                                                           // Decap L2 header.
-		fwdconfig.LookupAction(NHActionTable), // Apply additional encap actions
-		fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_DEC, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithValue([]byte{0x1}), // Decrement TTL.
-		fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),                                                         // Encap L2 header.
-		fwdconfig.LookupAction(NeighborTable), // Lookup in the neighbor table.
-		fwdconfig.LookupAction(SRCMACTable),   // Update source mac
+		fwdconfig.LookupAction(NHActionTable),                                                                                                           // Apply additional encap actions
+		fwdconfig.LookupAction(ttlDecTable),                                                                                                             // Decrement TTL unless skipped by tunnel encap.
+		fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),                                                                           // Encap L2 header.
+		fwdconfig.LookupAction(NeighborTable),                                                                                                           // Lookup in the neighbor table.
+		fwdconfig.LookupAction(SRCMACTable),                                                                                                             // Update source mac
+		fwdconfig.LookupAction(fdbTable),                                                                                                                // Resolve VLAN member egress port if FDB entry exists.
+		fwdconfig.LookupAction(egressVlanTable),                                                                                                         // Add 802.1Q VLAN tag if egress port is tagged member.
 	).AppendEntry(
 		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ACTION).WithBytes([]byte{2}))), // COPY AND DROP
 		fwdconfig.TransmitAction(cpuPortID),
 	).AppendEntry(
 		fwdconfig.EntryDesc(fwdconfig.ExactEntry(fwdconfig.PacketFieldBytes(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_PACKET_ACTION).WithBytes([]byte{3}))), // COPY AND FORWARD
 		fwdconfig.MirrorAction().WithPort(cpuPortID, fwdpb.PortAction_PORT_ACTION_OUTPUT).WithFields(fwdconfig.PacketFieldIDField(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TRAP_ID, 0), fwdconfig.PacketFieldIDField(fwdpb.PacketFieldNum_PACKET_FIELD_NUM_TARGET_EGRESS_PORT, 0)),
-		fwdconfig.DecapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),                                                         // Decap L2 header.
-		fwdconfig.LookupAction(NHActionTable),                                                                                         // Apply additional encap actions
-		fwdconfig.UpdateAction(fwdpb.UpdateType_UPDATE_TYPE_DEC, fwdpb.PacketFieldNum_PACKET_FIELD_NUM_IP_HOP).WithValue([]byte{0x1}), // Decrement TTL.
-		fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),                                                         // Encap L2 header.
-		fwdconfig.LookupAction(NeighborTable),                                                                                         // Lookup in the neighbor table.
-		fwdconfig.LookupAction(SRCMACTable),                                                                                           // Update source mac
+		fwdconfig.DecapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),   // Decap L2 header.
+		fwdconfig.LookupAction(NHActionTable),                                   // Apply additional encap actions
+		fwdconfig.LookupAction(ttlDecTable),                                     // Decrement TTL unless skipped by tunnel encap.
+		fwdconfig.EncapAction(fwdpb.PacketHeaderId_PACKET_HEADER_ID_ETHERNET),   // Encap L2 header.
+		fwdconfig.LookupAction(NeighborTable),                                   // Lookup in the neighbor table.
+		fwdconfig.LookupAction(SRCMACTable),                                     // Update source mac
+		fwdconfig.LookupAction(fdbTable),                                        // Resolve VLAN member egress port if FDB entry exists.
+		fwdconfig.LookupAction(egressVlanTable),                                 // Add 802.1Q VLAN tag if egress port is tagged member.
 	)
 	if _, err := sw.dataplane.TableEntryAdd(ctx, req.Build()); err != nil {
 		return err
@@ -1160,19 +1474,37 @@ func (sw *saiSwitch) createOutputTable(ctx context.Context, cpuPortID string) er
 }
 
 func (sw *saiSwitch) SetSwitchAttribute(ctx context.Context, req *saipb.SetSwitchAttributeRequest) (*saipb.SetSwitchAttributeResponse, error) {
-	switch {
-	case req.PreIngressAcl != nil:
+	if req.PreIngressAcl != nil {
 		if err := sw.bindACLTable(ctx, fmt.Sprint(req.GetPreIngressAcl()), PreIngressActionTable); err != nil {
 			return nil, err
 		}
-	case req.IngressAcl != nil:
+	}
+	if req.IngressAcl != nil {
 		if err := sw.bindACLTable(ctx, fmt.Sprint(req.GetIngressAcl()), IngressActionTable); err != nil {
 			return nil, err
 		}
-	case req.EgressAcl != nil:
+	}
+	if req.EgressAcl != nil {
 		if err := sw.bindACLTable(ctx, fmt.Sprint(req.GetEgressAcl()), EgressActionTable); err != nil {
 			return nil, err
 		}
+	}
+	if req.SrcMacAddress != nil {
+		sw.mu.Lock()
+		defer sw.mu.Unlock()
+		if !sw.mgr.Exists(fmt.Sprint(req.GetOid())) {
+			return nil, status.Errorf(codes.NotFound, "switch %d not found", req.GetOid())
+		}
+		oldAttr := &saipb.SwitchAttribute{}
+		if err := sw.mgr.PopulateAllAttributes(fmt.Sprint(req.GetOid()), oldAttr); err != nil {
+			return nil, err
+		}
+		if err := sw.macTracker.replace(ctx, oldAttr.GetSrcMacAddress(), req.GetSrcMacAddress()); err != nil {
+			return nil, err
+		}
+		sw.mgr.StoreAttributes(req.GetOid(), &saipb.SwitchAttribute{
+			SrcMacAddress: req.SrcMacAddress,
+		})
 	}
 	return &saipb.SetSwitchAttributeResponse{}, nil
 }
@@ -1271,6 +1603,9 @@ func (sw *saiSwitch) Reset() {
 	sw.vlan.Reset()
 	sw.port.Reset()
 	sw.hostif.Reset()
+	sw.macTracker.Reset()
+	sw.routerInterface.Reset()
+	sw.tunnel.Reset()
 }
 
 // GetSwitchStats returns the statistics for the switch.

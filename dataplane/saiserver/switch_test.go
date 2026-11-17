@@ -256,6 +256,7 @@ type fakeSwitchDataplane struct {
 	addErrOnCall             int
 	addErrCount              int
 	addErr                   error
+	objectNIDErr             error
 }
 
 func (f *fakeSwitchDataplane) NotifySubscribe(_ *fwdpb.NotifySubscribeRequest, srv fwdpb.Forwarding_NotifySubscribeServer) error {
@@ -341,6 +342,9 @@ func (f *fakeSwitchDataplane) AttributeUpdate(context.Context, *fwdpb.AttributeU
 
 func (f *fakeSwitchDataplane) ObjectNID(_ context.Context, req *fwdpb.ObjectNIDRequest) (*fwdpb.ObjectNIDReply, error) {
 	f.gotObjectNIDReqs = append(f.gotObjectNIDReqs, req)
+	if f.objectNIDErr != nil {
+		return nil, f.objectNIDErr
+	}
 
 	// Derive unique nid by using request object id to prevent collisions in tests.
 	id, _ := strconv.ParseUint(req.GetObjectId().GetId(), 10, 64)
